@@ -1,6 +1,6 @@
 # mmVitals-Projekt
 reinstalled the Radar Tool box using the chrome plugin and software tool found here: 
-<img width="1593" height="841" alt="image" src="https://github.com/user-attachments/assets/deda2cb1-0b21-4a00-b76a-80517c453446" />
+<img width="1000" height="841" alt="image" src="https://github.com/user-attachments/assets/deda2cb1-0b21-4a00-b76a-80517c453446" />
 
 
 Source Code for IWR1843BOOST Radar
