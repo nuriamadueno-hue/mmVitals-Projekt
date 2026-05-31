@@ -19,7 +19,7 @@ Configure IWR1843BOOST
      4. Send Config command "Data Path Config" to IWR1843BOOST Radar to set the LVDS Stream Enabled
         Location: 
         send using
------------------------------------------------------------------------------------------------------------------------
+
 
     
  
