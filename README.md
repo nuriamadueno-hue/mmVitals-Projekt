@@ -5,8 +5,10 @@ Aditional Tools to install
     1. reinstalled the Radar Tool box using the chrome plugin and software tool found here: 
 <img width="660" height="370" alt="image" src="https://github.com/user-attachments/assets/deda2cb1-0b21-4a00-b76a-80517c453446" />
 
-    2. Installed mmWave Studio: https://www.ti.com/tool/MMWAVE-SDK#downloads
-
+    2. Installed mmWave sdk: https://www.ti.com/tool/MMWAVE-SDK#downloads
+    
+    3. Installed mmWave Studio: https://www.ti.com/tool/MMWAVE-STUDIO
+        A myTi Acoutn is required here. 
 
 Configure IWR1843BOOST
 -----------------------------------------------------------------------------------------------------------------------
@@ -28,12 +30,28 @@ Configure DCA1000EVM
     1. Configure Your PC Network Card
         PC IP Address:   192.168.33.30
         Subnet Mask:     255.255.255.0
+        
+        Power shell comands to achive this:
+            "New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.33.30 -PrefixLength 24"
+        or
+            "Set-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.33.30 -PrefixLength 24"
+
+        May be verified using cmd Window and the comand "ipconfig"
+        
     2. Send the FPGA Configuration Command: Through mmWave Studio (or custom UDP sockets)
         "Capture raw data mode"
         "Split files into 100MB chunks"
         "Stream data packets to target IP 192.168.33.30 on port 4098"
-     3. Arm the DCA1000 send command:
+
+        This can be done using the DCA1000EVM_CLI.exe locateted here: C:\ti\mmwave_studio_02_01_01_00\mmWaveStudio\PostProc
+            to execute this correctly we should create a jason file with the comands we want to send to the FPGA and call the json file cf.json
+            then we can navigate the cmd line to the location of the DCA1000EVM_CLI.exe and use the comnand DCA1000EVM_CLI.exe fpga cf.json
+    
+    3. Arm the DCA1000 send command:
          "Arm Capture"
+         Same method as above
+
+    (This can later be autoamted with python lets just move forward as is for testing) 
 
 Items that may be of use later
 -----------------------------------------------------------------------------------------------------------------------
