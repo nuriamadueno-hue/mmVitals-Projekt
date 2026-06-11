@@ -56,3 +56,8 @@ Configure DCA1000EVM
 Items that may be of use later
 -----------------------------------------------------------------------------------------------------------------------
     mmWave_Demo_Visualizer: https://dev.ti.com/gallery/view/mmwave/mmWave_Demo_Visualizer/ver/3.6.0/
+
+
+
+
+    https://www.ti.com/tool/IWR1843BOOST#order-start-development
