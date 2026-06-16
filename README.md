@@ -67,3 +67,8 @@ Items that may be of use later
 4. When configuring the SensorConfi tab, apply the following settings under the LVDS Lane Config section: Lane Format: Select Format 0, Lane 1: Enable, Lane 2: Enable, Lane 3: Leave Disabled, Lane 4: Leave Disabled. Hinweis: The settings you apply in the SensorConfig tab configure the radar chip itself. You must ensure that the data capture card is expecting the same layout. Click on the DCA1000 CLI control sectionn and make sure the capture card lane mode is also explicitly set to 2 Lanes. If this is set to 4 lanes while the sensor outputs 2, your data stream will desynchronize, and mmWave Studio will throw a packet -loss or post-processing error.
 5. SensorConfiguration Tab Inputs:
    <img width="1102" height="663" alt="WhatsApp Image 2026-06-11 at 19 41 16" src="https://github.com/user-attachments/assets/0ff0b56e-5746-43a9-8ecb-4841ac96e37f" />
+
+
+
+
+Infromational article on Radar Basics: https://medium.com/@itberrios6/introduction-to-radar-part-2-8a332066917e
