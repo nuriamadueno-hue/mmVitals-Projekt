@@ -1,0 +1,49 @@
+mmWave Studio DCA1000 processing summary
+==============================================
+Project root:   C:\Users\gille\Desktop\mmWave_Studio
+Data folder:    C:\Users\gille\Desktop\mmWave_Studio\ADC_Recorded_Data
+Config folder:  C:\Users\gille\Desktop\mmWave_Studio\mmWave_Configuration
+Results folder: C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results
+
+BIN file:       C:\Users\gille\Desktop\mmWave_Studio\ADC_Recorded_Data\ADC_Data.bin
+Config sources: api_log:C:\Users\gille\Desktop\mmWave_Studio\ADC_Recorded_Data\ADC_Data_LogFile.txt, profile_csv:C:\Users\gille\Desktop\mmWave_Studio\mmWave_Configuration\Profile.csv, raw_log:C:\Users\gille\Desktop\mmWave_Studio\ADC_Recorded_Data\ADC_Data_Raw_LogFile.csv
+
+Parsed cube:
+  cube_chirps shape: (2400, 4, 256) = (chirps, RX, ADC samples)
+  cube_frames shape: (600, 4, 4, 256) = (frames, chirps/frame, RX, ADC samples)
+  partial chirps:    0
+
+Config used:
+  capture_board:          DCA1000
+  device:                 AR1642
+  parser_format:          dca1000_xwr16xx
+  rx_mask / num_rx:       15 / 4
+  tx_channel_mask:        3
+  chirp_tx_masks:         {0: 1}
+  num_adc_samples:        256
+  num_adc_bits:           16
+  complex_iq:             True
+  iq_swap:                0
+  num_lanes:              2
+  chirps_per_frame:       4
+  configured_frames:      600
+  frame_periodicity_ms:   50.00000000000001
+  vital_slow_time_rate_hz:19.999999999999996
+  start_freq_ghz:         77.0
+  slope_mhz_per_us:       29.9820003509521
+  sample_rate_ksps:       10000.0
+  idle_time_us:           100.0
+  ramp_end_time_us:       60.0
+  adc_start_time_us:      6.0
+
+Saved files:
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_parsed.npz
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_summary.json
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_summary.txt
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_rd.npy
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_range_axis_m.npy
+  C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_doppler_axis_mps.npy
+
+Warnings:
+  - AdvancedFrameConfig was found in the API log. This script uses normal FrameConfig unless you add custom subframe handling.
+  - Channel config enables more than one TX, but the chirp config uses one TX per chirp. Treat this as 1 TX x RX for this capture unless you add multiple chirp configs for TDM-MIMO.
