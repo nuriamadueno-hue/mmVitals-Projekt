@@ -1,5 +1,6 @@
 {
-  "input_parsed_file": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\Data_Procesing\\Preliminary_Results\\ADC_Data_parsed.npz",
+  "input_adc_bin_file": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data.bin",
+  "intermediate_parsed_file_used": false,
   "cube_frames_shape_total": [
     600,
     4,
@@ -12,15 +13,15 @@
   "capture_duration_s": 30.000000000000007,
   "vital_sample_rate_hz": 19.999999999999996,
   "range_fft_size": 512,
-  "selected_range_bin": 8,
-  "selected_range_m": 0.7811782238374313,
+  "selected_range_bin": 17,
+  "selected_range_m": 1.6600037256545415,
   "selected_rx": 0,
   "rx_mode": "strongest",
   "wavelength_m": 0.0038934085454545454,
-  "breathing_rate_breaths_per_min": 16.113281249999996,
-  "breathing_quality_db": 7.61723836119553,
-  "heart_rate_beats_per_min": 73.82812499999999,
-  "heart_quality_db": 10.444562574975393,
+  "breathing_rate_breaths_per_min": 18.457031249999996,
+  "breathing_quality_db": 7.761969455523493,
+  "heart_rate_beats_per_min": 71.77734374999999,
+  "heart_quality_db": 6.808965520815638,
   "breathing_band_hz": [
     0.1,
     0.6
@@ -29,5 +30,85 @@
     0.8,
     2.0
   ],
+  "parser_metadata": {
+    "bin_path": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data.bin",
+    "file_bytes": 9830400,
+    "raw_int16_words_after_optional_truncate": 4915200,
+    "words_per_chirp_for_file": 2048,
+    "words_per_chirp_enabled_rx": 2048,
+    "num_chirps_in_file": 2400,
+    "num_complete_configured_frames": 600,
+    "num_partial_chirps": 0,
+    "cube_chirps_shape": [
+      2400,
+      4,
+      256
+    ],
+    "cube_frames_shape": [
+      600,
+      4,
+      4,
+      256
+    ],
+    "config": {
+      "capture_board": "DCA1000",
+      "device": "AR1642",
+      "parser_format": "dca1000_xwr16xx",
+      "rx_mask": 15,
+      "tx_channel_mask": 3,
+      "num_rx": 4,
+      "num_tx_channels_enabled": 2,
+      "num_adc_samples": 256,
+      "num_adc_bits": 16,
+      "is_complex": true,
+      "iq_swap": 0,
+      "ch_interleave": 1,
+      "num_lanes": 2,
+      "lane_mask": 3,
+      "lane_format": 0,
+      "lvds_msb_first": 1,
+      "chirp_start_idx": 0,
+      "chirp_end_idx": 0,
+      "unique_chirps_per_loop": 1,
+      "loop_count": 4,
+      "chirps_per_frame": 4,
+      "num_frames_configured": 600,
+      "frame_periodicity_ms": 50.00000000000001,
+      "chirp_tx_masks": {
+        "0": 1
+      },
+      "tx_enabled_in_chirp_count": 1,
+      "start_freq_ghz": 77.0,
+      "freq_slope_mhz_per_us": 29.9820003509521,
+      "dig_out_sample_rate_ksps": 10000.0,
+      "idle_time_us": 100.0,
+      "ramp_end_time_us": 60.0,
+      "adc_start_time_us": 6.0,
+      "tx_start_time_us": 0.0,
+      "rx_gain_db": 30.0,
+      "test_source_enabled": 0,
+      "advanced_frame_seen": true,
+      "sources_used": [
+        "api_log:C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data_LogFile.txt",
+        "profile_csv:C:\\Users\\gille\\Desktop\\mmWave_Studio\\mmWave_Configuration\\Profile.csv",
+        "raw_log:C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data_Raw_LogFile.csv"
+      ],
+      "config_warnings": [
+        "AdvancedFrameConfig was found in the API log. This script uses normal FrameConfig unless you add custom subframe handling."
+      ]
+    },
+    "config_diagnostics": {
+      "api_log": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data_LogFile.txt",
+      "profile_csv": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\mmWave_Configuration\\Profile.csv",
+      "raw_capture_log": {
+        "raw_log_file": "C:\\Users\\gille\\Desktop\\mmWave_Studio\\ADC_Recorded_Data\\ADC_Data_Raw_LogFile.csv",
+        "raw_log_num_lanes": 2,
+        "out_of_sequence_count": 0,
+        "received_packets": 0,
+        "zero_filled_packets": 0,
+        "zero_filled_bytes": 0
+      }
+    }
+  },
   "note": "Engineering/prototype estimate only; not for medical diagnosis."
 }

@@ -9,11 +9,11 @@ Max file size (MB) : 1024,
 Raw Data :
 Out of sequence count - 0
 Out of sequence seen from 0 to 0
-First Packet ID - 1
-Last Packet ID - 6752
-Number of received packets - 6752
+First Packet ID - 0
+Last Packet ID - 0
+Number of received packets - 0
 Number of zero filled packets - 0
 Number of zero filled bytes - 0
-Capture start time - Wed Jun 17 19:09:47 2026
-Capture end time - Wed Jun 17 19:10:19 2026
-Duration(sec) - 32
+Capture start time - Wed Jun 17 19:48:59 2026
+Capture end time - Wed Jun 17 19:48:59 2026
+Duration(sec) - 0

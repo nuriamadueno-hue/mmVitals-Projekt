@@ -1,6 +1,7 @@
-Vital signs analysis summary
-============================
-input_parsed_file: C:\Users\gille\Desktop\mmWave_Studio\Data_Procesing\Preliminary_Results\ADC_Data_parsed.npz
+ADC-to-vital-signs analysis summary
+===================================
+input_adc_bin_file: C:\Users\gille\Desktop\mmWave_Studio\ADC_Recorded_Data\ADC_Data.bin
+intermediate_parsed_file_used: False
 cube_frames_shape_total: [600, 4, 4, 256]
 analyzed_frame_start: 0
 analyzed_frame_end_exclusive: 600
@@ -8,15 +9,16 @@ analyzed_frames: 600
 capture_duration_s: 30.000000000000007
 vital_sample_rate_hz: 19.999999999999996
 range_fft_size: 512
-selected_range_bin: 8
-selected_range_m: 0.7811782238374313
+selected_range_bin: 17
+selected_range_m: 1.6600037256545415
 selected_rx: 0
 rx_mode: strongest
 wavelength_m: 0.0038934085454545454
-breathing_rate_breaths_per_min: 16.113281249999996
-breathing_quality_db: 7.61723836119553
-heart_rate_beats_per_min: 73.82812499999999
-heart_quality_db: 10.444562574975393
+breathing_rate_breaths_per_min: 18.457031249999996
+breathing_quality_db: 7.761969455523493
+heart_rate_beats_per_min: 71.77734374999999
+heart_quality_db: 6.808965520815638
 breathing_band_hz: [0.1, 0.6]
 heart_band_hz: [0.8, 2.0]
+parser_metadata: see JSON summary
 note: Engineering/prototype estimate only; not for medical diagnosis.
