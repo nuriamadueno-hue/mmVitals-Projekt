@@ -74,3 +74,17 @@ Items that may be of use later
 Infromational article on Radar Basics: https://medium.com/@itberrios6/introduction-to-radar-part-2-8a332066917e
 
 Run Python script with: py Data_Procesing\ADC_To_Vital_Signs.py from Root Directory
+
+We need to updat ethe setting sof the radar and the code to achive this:
+    The AoA model is still simplified
+
+    The code assumes a simple 4-RX uniform linear array with 0.5 wavelength spacing:
+
+    --rx-spacing-lambda 0.5
+    --rx-order 0,1,2,3
+
+    This is useful, but not fully calibrated.
+
+    The current setup appears to use only one active TX chirp, so this is not full TDM-MIMO angle processing. That means the angle estimate is useful for rough left/right separation, but not high-confidence angular localization.
+
+    This affects multi-person separation. If two people are at similar range and similar angle, the code can still mix their signals.
