@@ -1507,37 +1507,121 @@ def _fft_bandpass(signal, fs, low_hz, high_hz):
     return np.fft.irfft(spec, n=n)
 
 
-def _estimate_rate_fft(signal, fs, low_hz, high_hz):
+def _quadratic_peak_interpolation(power, peak_idx):
+    """Return sub-bin peak offset using a quadratic fit around the FFT peak.
+
+    The interpolation is performed on log power, which is usually more stable
+    for narrow spectral peaks than linear power. The returned offset is in FFT
+    bins and clipped to +/- 0.5 so a noisy side bin cannot move the estimate
+    unrealistically far from the selected peak.
+    """
+    idx = int(peak_idx)
+    if idx <= 0 or idx >= len(power) - 1:
+        return 0.0
+
+    y0 = math.log(float(power[idx - 1]) + 1e-30)
+    y1 = math.log(float(power[idx]) + 1e-30)
+    y2 = math.log(float(power[idx + 1]) + 1e-30)
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-30:
+        return 0.0
+
+    delta = 0.5 * (y0 - y2) / denom
+    if not math.isfinite(delta):
+        return 0.0
+    return float(max(-0.5, min(0.5, delta)))
+
+
+def _estimate_rate_fft(signal, fs, low_hz, high_hz, args=None):
+    """Estimate a vital rate from the band-limited slow-time signal.
+
+    The true physical resolution is still set by the analyzed duration,
+    approximately fs / N. This function improves readout accuracy by using a
+    zero-padded FFT and a quadratic interpolation around the spectral peak.
+    """
     x = np.asarray(signal, dtype=np.float64)
     n = x.size
     if n < 8:
-        return float("nan"), float("nan"), np.array([]), np.array([])
+        return {
+            "rate_per_min": float("nan"),
+            "raw_bin_rate_per_min": float("nan"),
+            "quality_db": float("nan"),
+            "freqs_hz": np.array([]),
+            "power": np.array([]),
+            "n_samples": int(n),
+            "n_fft": 0,
+            "true_resolution_per_min": float("nan"),
+            "padded_spacing_per_min": float("nan"),
+            "interpolation_delta_bins": 0.0,
+            "peak_bin_index": -1,
+        }
 
     x = x - np.nanmean(x)
     x = x * _hann(n)
 
-    # Zero padding improves plot resolution, not true measurement resolution.
-    n_fft = int(2 ** math.ceil(math.log(max(n, 256), 2)))
-    n_fft = max(n_fft, 4096)
+    pad_factor = 8.0
+    min_fft = 4096
+    if args is not None:
+        pad_factor = max(1.0, float(getattr(args, "vital_fft_zeropad_factor", pad_factor)))
+        min_fft = max(16, int(getattr(args, "vital_fft_min_size", min_fft)))
+
+    requested = int(math.ceil(max(float(n), 256.0) * pad_factor))
+    n_fft = int(2 ** math.ceil(math.log(max(requested, min_fft), 2)))
 
     spec = np.fft.rfft(x, n=n_fft)
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
     power = np.abs(spec) ** 2
 
     band = (freqs >= low_hz) & (freqs <= high_hz)
+    true_resolution_per_min = 60.0 * float(fs) / float(n)
+    padded_spacing_per_min = 60.0 * float(fs) / float(n_fft)
+
     if not np.any(band):
-        return float("nan"), float("nan"), freqs, power
+        return {
+            "rate_per_min": float("nan"),
+            "raw_bin_rate_per_min": float("nan"),
+            "quality_db": float("nan"),
+            "freqs_hz": freqs,
+            "power": power,
+            "n_samples": int(n),
+            "n_fft": int(n_fft),
+            "true_resolution_per_min": true_resolution_per_min,
+            "padded_spacing_per_min": padded_spacing_per_min,
+            "interpolation_delta_bins": 0.0,
+            "peak_bin_index": -1,
+        }
 
     idxs = np.where(band)[0]
-    best = idxs[np.argmax(power[idxs])]
-    freq_hz = float(freqs[best])
-    rate_per_min = 60.0 * freq_hz
+    best = int(idxs[np.argmax(power[idxs])])
+    raw_freq_hz = float(freqs[best])
+
+    interpolate = True
+    if args is not None:
+        interpolate = bool(getattr(args, "vital_fft_interpolate", True))
+    delta = _quadratic_peak_interpolation(power, best) if interpolate else 0.0
+    interp_freq_hz = float((float(best) + delta) * float(fs) / float(n_fft))
+    interp_freq_hz = max(float(low_hz), min(float(high_hz), interp_freq_hz))
+
+    raw_rate_per_min = 60.0 * raw_freq_hz
+    rate_per_min = 60.0 * interp_freq_hz
 
     # Simple peak quality metric: best peak relative to median band power.
     med = float(np.median(power[idxs])) if idxs.size else 0.0
     quality_db = 10.0 * math.log10((float(power[best]) + 1e-30) / (med + 1e-30))
 
-    return rate_per_min, quality_db, freqs, power
+    return {
+        "rate_per_min": float(rate_per_min),
+        "raw_bin_rate_per_min": float(raw_rate_per_min),
+        "quality_db": float(quality_db),
+        "freqs_hz": freqs,
+        "power": power,
+        "n_samples": int(n),
+        "n_fft": int(n_fft),
+        "true_resolution_per_min": float(true_resolution_per_min),
+        "padded_spacing_per_min": float(padded_spacing_per_min),
+        "interpolation_delta_bins": float(delta),
+        "peak_bin_index": int(best),
+    }
 
 
 def _select_range_bin(range_profile, range_axis, has_metric_axis, min_range_m, max_range_m, min_bin, max_bin):
@@ -1561,6 +1645,487 @@ def _select_range_bin(range_profile, range_axis, has_metric_axis, min_range_m, m
     return int(np.nanargmax(rp))
 
 
+
+def _angle_grid_deg(min_deg, max_deg, step_deg):
+    if step_deg <= 0:
+        raise ValueError("angle step must be > 0")
+    if max_deg < min_deg:
+        raise ValueError("angle max must be >= angle min")
+    count = int(math.floor((max_deg - min_deg) / step_deg)) + 1
+    grid = min_deg + step_deg * np.arange(count, dtype=np.float64)
+    if grid.size == 0 or grid[-1] < max_deg - 1e-9:
+        grid = np.append(grid, float(max_deg))
+    return grid
+
+
+def _steering_vector_ula(num_rx, angle_deg, rx_spacing_lambda=0.5):
+    """Return a simple azimuth steering vector for a uniform linear RX array.
+
+    This assumes RX channels are ordered along the azimuth array and separated
+    by rx_spacing_lambda wavelengths. For IWR1843/xWR16xx captures using only
+    one TX, this gives a useful first-order azimuth AoA estimate from the 4 RX
+    channels. If your hardware/channel order differs, use --invert-angle-sign
+    or --rx-order to correct it.
+    """
+    idx = np.arange(int(num_rx), dtype=np.float64)
+    theta = math.radians(float(angle_deg))
+    phase = -2.0 * math.pi * float(rx_spacing_lambda) * np.sin(theta) * idx
+    return np.exp(1j * phase).astype(np.complex128)
+
+
+def _parse_rx_order(rx_order_text, num_rx):
+    if rx_order_text is None or str(rx_order_text).strip() == "":
+        return list(range(num_rx))
+    parts = [x.strip() for x in str(rx_order_text).split(",") if x.strip() != ""]
+    order = [int(x) for x in parts]
+    if sorted(order) != list(range(num_rx)):
+        raise ValueError("--rx-order must be a comma-separated permutation of 0..{}".format(num_rx - 1))
+    return order
+
+
+def _candidate_range_mask(range_axis, has_metric_axis, num_bins, min_range_m, max_range_m, min_bin, max_bin):
+    mask = np.ones(int(num_bins), dtype=bool)
+    if min_bin is not None and int(min_bin) > 0:
+        mask[: int(min_bin)] = False
+    if max_bin is not None and int(max_bin) < num_bins:
+        mask[int(max_bin) :] = False
+    if has_metric_axis:
+        metric_mask = (range_axis[:num_bins] >= float(min_range_m)) & (range_axis[:num_bins] <= float(max_range_m))
+        if np.any(metric_mask):
+            mask &= metric_mask
+    if not np.any(mask):
+        raise ValueError("No valid range bins after applying range and bin limits.")
+    return mask
+
+
+
+def _compute_range_angle_map(range_fft_pos, range_axis_pos, has_metric_axis, args):
+    """Compute a moving-target range-angle power map for multi-person detection.
+
+    range_fft_pos shape: (frames, rx, positive_range_bins)
+    Returns a dictionary with map power shaped (candidate_ranges, angles).
+    """
+    n_frames, n_rx, n_bins = range_fft_pos.shape
+    rx_order = _parse_rx_order(args.rx_order, n_rx)
+    x_all = range_fft_pos[:, rx_order, :]
+
+    if args.invert_angle_sign:
+        min_angle = -float(args.angle_max_deg)
+        max_angle = -float(args.angle_min_deg)
+    else:
+        min_angle = float(args.angle_min_deg)
+        max_angle = float(args.angle_max_deg)
+
+    angle_grid_internal = _angle_grid_deg(min_angle, max_angle, float(args.angle_step_deg))
+    angle_grid_reported = -angle_grid_internal if args.invert_angle_sign else angle_grid_internal
+
+    range_mask = _candidate_range_mask(
+        range_axis_pos,
+        has_metric_axis,
+        n_bins,
+        float(args.min_range_m),
+        float(args.max_range_m),
+        int(args.min_range_bin),
+        args.max_range_bin,
+    )
+    candidate_bins = np.where(range_mask)[0]
+
+    # Mean non-static range profile for plotting and fallback diagnostics.
+    range_profile = np.mean(np.abs(x_all), axis=(0, 1))
+
+    x_scan = x_all[:, :, candidate_bins]
+    if args.angle_remove_static_mean:
+        # Use moving energy for detection, not static reflectors from furniture/walls.
+        x_scan = x_scan - np.mean(x_scan, axis=0, keepdims=True)
+
+    power_map = np.zeros((candidate_bins.size, angle_grid_internal.size), dtype=np.float64)
+    for a_idx, angle in enumerate(angle_grid_internal):
+        steer = _steering_vector_ula(n_rx, angle, float(args.rx_spacing_lambda))
+        weights = np.conj(steer) / float(n_rx)
+        y = np.einsum('frb,r->fb', x_scan, weights)
+        power_map[:, a_idx] = np.mean(np.abs(y) ** 2, axis=0)
+
+    return {
+        "power_map": power_map,
+        "candidate_bins": candidate_bins,
+        "angle_grid_internal": angle_grid_internal,
+        "angle_grid_reported": angle_grid_reported,
+        "range_profile": range_profile,
+        "rx_order": rx_order,
+        "rx_spacing_lambda": float(args.rx_spacing_lambda),
+    }
+
+
+def _detect_range_angle_targets(ra, range_axis_pos, has_metric_axis, args):
+    """Find locally separated subject candidates in a range-angle map."""
+    power_map = np.asarray(ra["power_map"], dtype=np.float64)
+    candidate_bins = np.asarray(ra["candidate_bins"], dtype=int)
+    angle_grid_reported = np.asarray(ra["angle_grid_reported"], dtype=np.float64)
+    angle_grid_internal = np.asarray(ra["angle_grid_internal"], dtype=np.float64)
+
+    if power_map.size == 0:
+        return []
+
+    median_power = float(np.median(power_map))
+    max_power = float(np.max(power_map))
+    if not np.isfinite(max_power) or max_power <= 0:
+        return []
+
+    min_rel_db = float(args.target_min_relative_db)
+    min_abs_quality_db = float(args.target_min_quality_db)
+    max_targets = max(1, int(args.max_subjects))
+
+    # Convert suppression distances from engineering units to index distances.
+    if has_metric_axis and len(range_axis_pos) > 1:
+        diffs = np.diff(range_axis_pos)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        bin_spacing_m = float(np.median(diffs)) if diffs.size else 0.1
+    else:
+        bin_spacing_m = 0.1
+    suppress_range_bins = max(1, int(round(float(args.target_min_separation_m) / max(bin_spacing_m, 1e-9))))
+    suppress_angle_bins = max(1, int(round(float(args.target_min_separation_deg) / max(float(args.angle_step_deg), 1e-9))))
+
+    work = power_map.copy()
+    targets = []
+    for subject_idx in range(max_targets):
+        flat_idx = int(np.argmax(work))
+        peak = float(work.flat[flat_idx])
+        if not np.isfinite(peak) or peak <= 0:
+            break
+
+        rel_db = 10.0 * math.log10((peak + 1e-30) / (max_power + 1e-30))
+        quality_db = 10.0 * math.log10((peak + 1e-30) / (median_power + 1e-30))
+        if subject_idx > 0 and rel_db < min_rel_db:
+            break
+        if quality_db < min_abs_quality_db:
+            break
+
+        r_local, a_idx = np.unravel_index(flat_idx, work.shape)
+        rbin = int(candidate_bins[r_local])
+        angle_reported = float(angle_grid_reported[a_idx])
+        angle_internal = float(angle_grid_internal[a_idx])
+        selected_range = float(range_axis_pos[rbin]) if has_metric_axis else None
+
+        targets.append({
+            "subject_index": int(subject_idx + 1),
+            "selected_range_bin": int(rbin),
+            "selected_range_m": selected_range,
+            "selected_angle_deg": angle_reported,
+            "internal_angle_deg": angle_internal,
+            "target_power": peak,
+            "target_relative_power_db": float(rel_db),
+            "target_quality_db": float(quality_db),
+        })
+
+        # Non-maximum suppression around this target so adjacent bins/angles are not double-counted.
+        r0 = max(0, r_local - suppress_range_bins)
+        r1 = min(work.shape[0], r_local + suppress_range_bins + 1)
+        a0 = max(0, a_idx - suppress_angle_bins)
+        a1 = min(work.shape[1], a_idx + suppress_angle_bins + 1)
+        if getattr(args, "target_suppress_same_range_all_angles", True):
+            # With a 4-RX-only ULA, angular sidelobes can make one person appear as
+            # several angle peaks at the same range. Suppress the full local range
+            # interval by default. Use --allow-same-range-targets to disable this.
+            work[r0:r1, :] = -np.inf
+        else:
+            work[r0:r1, a0:a1] = -np.inf
+
+    return targets
+
+
+def _beamform_slow_complex_for_target(range_fft_pos, target, rx_order, rx_spacing_lambda):
+    n_rx = len(rx_order)
+    rbin = int(target["selected_range_bin"])
+    x_target = range_fft_pos[:, rx_order, rbin]
+    steer = _steering_vector_ula(n_rx, float(target["internal_angle_deg"]), float(rx_spacing_lambda))
+    return x_target @ (np.conj(steer) / float(n_rx))
+
+
+def _phase_to_displacement(slow_complex, fs_vital, wavelength, args):
+    phase = np.unwrap(np.angle(slow_complex))
+    drift_window = max(1, int(round(float(args.drift_window_s) * fs_vital)))
+    phase_detrended = phase - _moving_average(phase, drift_window)
+    displacement_m = phase_detrended * wavelength / (4.0 * math.pi)
+    displacement_m = displacement_m - np.mean(displacement_m)
+    return displacement_m
+
+
+def _extract_vitals_from_displacement(displacement_m, fs_vital, args):
+    displacement_m = np.asarray(displacement_m, dtype=np.float64)
+    displacement_m = displacement_m - np.nanmean(displacement_m)
+
+    breathing = _fft_bandpass(displacement_m, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz))
+    heart = _fft_bandpass(displacement_m, fs_vital, float(args.heart_low_hz), float(args.heart_high_hz))
+
+    breath_est = _estimate_rate_fft(
+        breathing, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz), args=args
+    )
+    heart_est = _estimate_rate_fft(
+        heart, fs_vital, float(args.heart_low_hz), float(args.heart_high_hz), args=args
+    )
+
+    return {
+        "displacement_m": displacement_m,
+        "breathing": breathing,
+        "heart": heart,
+        "breathing_rate_breaths_per_min": float(breath_est["rate_per_min"]),
+        "breathing_raw_bin_rate_breaths_per_min": float(breath_est["raw_bin_rate_per_min"]),
+        "breathing_quality_db": float(breath_est["quality_db"]),
+        "breathing_fft_n": int(breath_est["n_fft"]),
+        "breathing_true_resolution_per_min": float(breath_est["true_resolution_per_min"]),
+        "breathing_padded_spacing_per_min": float(breath_est["padded_spacing_per_min"]),
+        "breathing_interpolation_delta_bins": float(breath_est["interpolation_delta_bins"]),
+        "heart_rate_beats_per_min": float(heart_est["rate_per_min"]),
+        "heart_raw_bin_rate_beats_per_min": float(heart_est["raw_bin_rate_per_min"]),
+        "heart_quality_db": float(heart_est["quality_db"]),
+        "heart_fft_n": int(heart_est["n_fft"]),
+        "heart_true_resolution_per_min": float(heart_est["true_resolution_per_min"]),
+        "heart_padded_spacing_per_min": float(heart_est["padded_spacing_per_min"]),
+        "heart_interpolation_delta_bins": float(heart_est["interpolation_delta_bins"]),
+    }
+
+
+def _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args):
+    displacement_m = _phase_to_displacement(slow_complex, fs_vital, wavelength, args)
+    return _extract_vitals_from_displacement(displacement_m, fs_vital, args)
+
+
+def _range_bin_spacing_m(range_axis_pos, has_metric_axis):
+    if has_metric_axis and len(range_axis_pos) > 1:
+        diffs = np.diff(range_axis_pos)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size:
+            return float(np.median(diffs))
+    return 0.1
+
+
+def _make_subject_roi_cells(target, ra, range_axis_pos, has_metric_axis, args):
+    """Return range/angle cells around the target that represent the chest ROI.
+
+    The previous multi-subject version analyzed exactly one range-angle cell per
+    subject. That can be too narrow: the chest reflection can span adjacent
+    range bins and a few adjacent AoA bins. This ROI keeps cells around the
+    detected peak and rejects weak local sidelobes using a local relative
+    threshold.
+    """
+    power_map = np.asarray(ra["power_map"], dtype=np.float64)
+    candidate_bins = np.asarray(ra["candidate_bins"], dtype=int)
+    angles_internal = np.asarray(ra["angle_grid_internal"], dtype=np.float64)
+    angles_reported = np.asarray(ra["angle_grid_reported"], dtype=np.float64)
+
+    rbin = int(target["selected_range_bin"])
+    a_internal = float(target["internal_angle_deg"])
+    r_matches = np.where(candidate_bins == rbin)[0]
+    if not r_matches.size:
+        return []
+    r_local_center = int(r_matches[0])
+    a_center = int(np.argmin(np.abs(angles_internal - a_internal)))
+
+    spacing_m = _range_bin_spacing_m(range_axis_pos, has_metric_axis)
+    half_range_bins = max(0, int(round(float(args.chest_roi_range_m) / max(spacing_m, 1e-9))))
+    half_range_bins = max(half_range_bins, int(args.chest_roi_min_range_bins))
+    half_angle_bins = max(0, int(round(float(args.chest_roi_angle_deg) / max(float(args.angle_step_deg), 1e-9))))
+
+    # Prefer the centre of the detected chest target while still allowing the
+    # ROI to include adjacent bins. This prevents a stronger neighbouring edge
+    # or multipath bin from dominating the averaged motion.
+    sigma_range_bins = max(1.0, float(half_range_bins) * 0.65)
+    sigma_angle_bins = max(1.0, float(half_angle_bins) * 0.65)
+
+    r0 = max(0, r_local_center - half_range_bins)
+    r1 = min(power_map.shape[0], r_local_center + half_range_bins + 1)
+    a0 = max(0, a_center - half_angle_bins)
+    a1 = min(power_map.shape[1], a_center + half_angle_bins + 1)
+
+    local = power_map[r0:r1, a0:a1]
+    if local.size == 0 or not np.any(np.isfinite(local)):
+        return []
+
+    local_peak = float(np.nanmax(local))
+    min_power = local_peak * (10.0 ** (float(args.chest_roi_min_relative_db) / 10.0))
+
+    cells = []
+    for rr in range(r0, r1):
+        for aa in range(a0, a1):
+            pwr = float(power_map[rr, aa])
+            if not np.isfinite(pwr) or pwr < min_power:
+                continue
+            dr = float(rr - r_local_center) / sigma_range_bins
+            da = float(aa - a_center) / sigma_angle_bins
+            distance_weight = math.exp(-0.5 * (dr * dr + da * da))
+            cells.append({
+                "range_local_index": int(rr),
+                "angle_index": int(aa),
+                "distance_weight": float(distance_weight),
+                "range_bin": int(candidate_bins[rr]),
+                "range_m": float(range_axis_pos[int(candidate_bins[rr])]) if has_metric_axis else None,
+                "angle_internal_deg": float(angles_internal[aa]),
+                "angle_reported_deg": float(angles_reported[aa]),
+                "power": pwr,
+            })
+
+    # Keep strongest centre-weighted ROI cells first so the chest centre dominates over fringe cells.
+    cells.sort(key=lambda c: c["power"] * c.get("distance_weight", 1.0), reverse=True)
+    max_cells = max(1, int(args.chest_roi_max_cells))
+    return cells[:max_cells]
+
+
+def _beamform_slow_complex_for_cell(range_fft_pos, range_bin, angle_internal_deg, rx_order, rx_spacing_lambda):
+    n_rx = len(rx_order)
+    x_target = range_fft_pos[:, rx_order, int(range_bin)]
+    steer = _steering_vector_ula(n_rx, float(angle_internal_deg), float(rx_spacing_lambda))
+    return x_target @ (np.conj(steer) / float(n_rx))
+
+
+def _extract_vitals_from_subject_roi(range_fft_pos, target, ra, range_axis_pos, has_metric_axis, fs_vital, wavelength, args):
+    cells = _make_subject_roi_cells(target, ra, range_axis_pos, has_metric_axis, args)
+    if not cells:
+        slow_complex = _beamform_slow_complex_for_target(range_fft_pos, target, ra["rx_order"], ra["rx_spacing_lambda"])
+        vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
+        return vitals, {
+            "roi_enabled": False,
+            "roi_cell_count": 1,
+            "roi_range_bins": [int(target["selected_range_bin"])],
+            "roi_angle_bins_deg": [float(target["selected_angle_deg"])],
+            "roi_note": "fallback_single_cell",
+        }
+
+    seed_complex = _beamform_slow_complex_for_target(range_fft_pos, target, ra["rx_order"], ra["rx_spacing_lambda"])
+    seed_disp = _phase_to_displacement(seed_complex, fs_vital, wavelength, args)
+    seed_breath = _fft_bandpass(seed_disp, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz))
+
+    displacements = []
+    powers = []
+    accepted_cells = []
+    rejected_cells = []
+    for cell in cells:
+        slow_complex = _beamform_slow_complex_for_cell(
+            range_fft_pos,
+            cell["range_bin"],
+            cell["angle_internal_deg"],
+            ra["rx_order"],
+            ra["rx_spacing_lambda"],
+        )
+        disp = _phase_to_displacement(slow_complex, fs_vital, wavelength, args)
+        if not np.all(np.isfinite(disp)):
+            continue
+
+        breath = _fft_bandpass(disp, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz))
+        denom = float(np.linalg.norm(seed_breath) * np.linalg.norm(breath))
+        corr = float(np.dot(seed_breath, breath) / denom) if denom > 1e-30 else 0.0
+        abs_corr = abs(corr)
+        cell["breath_correlation_to_seed"] = corr
+
+        is_seed_cell = (int(cell["range_bin"]) == int(target["selected_range_bin"]) and
+                        abs(float(cell["angle_internal_deg"]) - float(target["internal_angle_deg"])) <= 0.5 * float(args.angle_step_deg) + 1e-9)
+        if (not is_seed_cell) and abs_corr < float(args.chest_roi_min_breath_corr):
+            rejected_cells.append(cell)
+            continue
+
+        if corr < 0.0:
+            disp = -disp
+        displacements.append(disp)
+        powers.append(max(float(cell["power"]) * float(cell.get("distance_weight", 1.0)) * max(abs_corr, 0.25), 1e-30))
+        accepted_cells.append(cell)
+
+    if not displacements:
+        slow_complex = _beamform_slow_complex_for_target(range_fft_pos, target, ra["rx_order"], ra["rx_spacing_lambda"])
+        vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
+        return vitals, {"roi_enabled": False, "roi_cell_count": 1, "roi_note": "fallback_no_finite_cells"}
+
+    disp_stack = np.vstack(displacements)
+
+    weights = np.sqrt(np.asarray(powers, dtype=np.float64))
+    weights = weights / max(float(np.sum(weights)), 1e-30)
+    displacement_roi = np.sum(disp_stack * weights[:, None], axis=0)
+    displacement_roi = displacement_roi - np.nanmean(displacement_roi)
+
+    vitals = _extract_vitals_from_displacement(displacement_roi, fs_vital, args)
+
+    unique_range_bins = sorted(set(int(c["range_bin"]) for c in accepted_cells))
+    unique_angles = sorted(set(float(c["angle_reported_deg"]) for c in accepted_cells))
+    range_vals = [float(range_axis_pos[b]) for b in unique_range_bins] if has_metric_axis else []
+    roi_info = {
+        "roi_enabled": True,
+        "roi_cell_count": int(len(accepted_cells)),
+        "roi_rejected_cell_count": int(len(rejected_cells)),
+        "roi_range_bins": unique_range_bins,
+        "roi_range_min_m": float(min(range_vals)) if range_vals else None,
+        "roi_range_max_m": float(max(range_vals)) if range_vals else None,
+        "roi_angle_min_deg": float(min(unique_angles)) if unique_angles else None,
+        "roi_angle_max_deg": float(max(unique_angles)) if unique_angles else None,
+        "roi_cell_min_relative_db": float(args.chest_roi_min_relative_db),
+        "roi_cells": accepted_cells,
+    }
+    return vitals, roi_info
+
+
+def _estimate_range_angle_target(range_fft_pos, range_axis_pos, has_metric_axis, args):
+    """Backward-compatible single-target AoA selection."""
+    ra = _compute_range_angle_map(range_fft_pos, range_axis_pos, has_metric_axis, args)
+
+    if args.angle_range_mode == "selected_range":
+        # Retain the older behavior: choose strongest range first, then scan angles only at that range.
+        range_profile = ra["range_profile"]
+        selected_bin = _select_range_bin(
+            range_profile,
+            range_axis_pos,
+            has_metric_axis,
+            float(args.min_range_m),
+            float(args.max_range_m),
+            int(args.min_range_bin),
+            args.max_range_bin,
+        )
+        candidate_bins = np.asarray([selected_bin], dtype=int)
+        old_candidates = ra["candidate_bins"]
+        idx = np.where(old_candidates == selected_bin)[0]
+        if idx.size:
+            power_map = ra["power_map"][idx, :]
+        else:
+            # Fallback should rarely be used.
+            power_map = ra["power_map"][:1, :]
+        ra_single = dict(ra)
+        ra_single["candidate_bins"] = candidate_bins
+        ra_single["power_map"] = power_map
+        targets = _detect_range_angle_targets(ra_single, range_axis_pos, has_metric_axis, args)
+    elif args.angle_range_mode == "range_angle_peak":
+        targets = _detect_range_angle_targets(ra, range_axis_pos, has_metric_axis, args)
+    else:
+        raise ValueError("Unknown angle_range_mode: {}".format(args.angle_range_mode))
+
+    if not targets:
+        raise ValueError("No range-angle target was detected. Try lowering --target-min-quality-db or widening the range limits.")
+
+    target = targets[0]
+    slow_complex = _beamform_slow_complex_for_target(range_fft_pos, target, ra["rx_order"], ra["rx_spacing_lambda"])
+
+    # Spectrum at selected range for diagnostics.
+    rbin = int(target["selected_range_bin"])
+    r_local_matches = np.where(ra["candidate_bins"] == rbin)[0]
+    angle_spectrum = None
+    if r_local_matches.size:
+        angle_spectrum = ra["power_map"][int(r_local_matches[0]), :]
+
+    return {
+        "slow_complex": slow_complex,
+        "selected_bin": int(target["selected_range_bin"]),
+        "selected_angle_deg": float(target["selected_angle_deg"]),
+        "internal_angle_deg": float(target["internal_angle_deg"]),
+        "angle_quality_db": float(target["target_quality_db"]),
+        "angle_grid_deg": ra["angle_grid_reported"],
+        "angle_spectrum_power": angle_spectrum,
+        "range_profile": ra["range_profile"],
+        "rx_order": ra["rx_order"],
+        "rx_spacing_lambda": ra["rx_spacing_lambda"],
+        "angle_range_mode": args.angle_range_mode,
+    }
+
+
+def _detect_multi_subjects(range_fft_pos, range_axis_pos, has_metric_axis, args):
+    ra = _compute_range_angle_map(range_fft_pos, range_axis_pos, has_metric_axis, args)
+    targets = _detect_range_angle_targets(ra, range_axis_pos, has_metric_axis, args)
+    return targets, ra
+
 def _make_output_paths(results_dir, stem):
     results_dir.mkdir(parents=True, exist_ok=True)
     return {
@@ -1572,6 +2137,7 @@ def _make_output_paths(results_dir, stem):
         "csv": results_dir / "{}_vital_signs_timeseries.csv".format(stem),
         "plot": results_dir / "{}_vital_signs_plot.png".format(stem),
         "range_plot": results_dir / "{}_range_profile.png".format(stem),
+        "angle_spectrum_npy": results_dir / "{}_angle_spectrum.npy".format(stem),
     }
 
 
@@ -1653,9 +2219,16 @@ def _json_default(obj):
     return str(obj)
 
 
+
+def _make_subject_output_paths(results_dir, stem, subject_index):
+    subject_stem = "{}_subject_{:02d}".format(stem, int(subject_index))
+    return _make_output_paths(results_dir, subject_stem)
+
+
 def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path, results_dir, stem):
     """Run the vital-sign algorithm directly from an in-memory parsed cube.
 
+    Supports either one target or multiple range-angle separated subjects.
     cube_frames shape: (frames, chirps_per_frame, rx, adc_samples)
     metadata: parser metadata dictionary returned by read_dca1000_adc_bin(...)
     """
@@ -1701,59 +2274,211 @@ def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path
     range_fft_pos = range_fft[:, :, :half]
     range_axis_pos = range_axis[:half]
 
-    # Mean range profile over frames and RX.
     range_profile = np.mean(np.abs(range_fft_pos), axis=(0, 1))
-
-    selected_bin = _select_range_bin(
-        range_profile,
-        range_axis_pos,
-        has_metric_axis,
-        float(args.min_range_m),
-        float(args.max_range_m),
-        int(args.min_range_bin),
-        args.max_range_bin,
-    )
-
-    # Extract complex slow-time signal at selected range bin.
-    rx_power = np.mean(np.abs(range_fft_pos[:, :, selected_bin]) ** 2, axis=0)
-    selected_rx = int(np.argmax(rx_power))
-
-    if args.rx_mode == "strongest":
-        slow_complex = range_fft_pos[:, selected_rx, selected_bin]
-    elif args.rx_mode == "rx0":
-        selected_rx = 0
-        slow_complex = range_fft_pos[:, 0, selected_bin]
-    elif args.rx_mode == "sum":
-        slow_complex = np.sum(range_fft_pos[:, :, selected_bin], axis=1)
-        selected_rx = -1
-    else:
-        raise ValueError("Unknown rx_mode: {}".format(args.rx_mode))
-
-    phase = np.unwrap(np.angle(slow_complex))
-
-    # Remove slow drift before conversion. Moving-average window default is about 2 s.
-    drift_window = max(1, int(round(float(args.drift_window_s) * fs_vital)))
-    phase_detrended = phase - _moving_average(phase, drift_window)
-
-    displacement_m = phase_detrended * wavelength / (4.0 * math.pi)
-    displacement_m = displacement_m - np.mean(displacement_m)
-
-    breathing = _fft_bandpass(displacement_m, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz))
-    heart = _fft_bandpass(displacement_m, fs_vital, float(args.heart_low_hz), float(args.heart_high_hz))
-
-    breath_bpm, breath_quality_db, breath_freqs, breath_power = _estimate_rate_fft(
-        breathing, fs_vital, float(args.breath_low_hz), float(args.breath_high_hz)
-    )
-    heart_bpm, heart_quality_db, heart_freqs, heart_power = _estimate_rate_fft(
-        heart, fs_vital, float(args.heart_low_hz), float(args.heart_high_hz)
-    )
-
     time_s = np.arange(n_frames, dtype=np.float64) / fs_vital
-    selected_range = float(range_axis_pos[selected_bin]) if has_metric_axis else None
+
+    subjects = []
+    angle_result = None
+    out_paths_by_name = {}
+
+    if args.angle_mode == "multi":
+        targets, ra = _detect_multi_subjects(range_fft_pos, range_axis_pos, has_metric_axis, args)
+        range_profile = ra["range_profile"]
+        for target in targets:
+            if bool(args.chest_roi_enable):
+                vitals, roi_info = _extract_vitals_from_subject_roi(
+                    range_fft_pos,
+                    target,
+                    ra,
+                    range_axis_pos,
+                    has_metric_axis,
+                    fs_vital,
+                    wavelength,
+                    args,
+                )
+                rx_mode_text = "range_angle_roi_beamformed"
+                angle_method_text = "4_rx_ula_range_angle_roi_beam_scan"
+            else:
+                slow_complex = _beamform_slow_complex_for_target(
+                    range_fft_pos,
+                    target,
+                    ra["rx_order"],
+                    ra["rx_spacing_lambda"],
+                )
+                vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
+                roi_info = {
+                    "roi_enabled": False,
+                    "roi_cell_count": 1,
+                    "roi_range_bins": [int(target["selected_range_bin"])],
+                    "roi_angle_bins_deg": [float(target["selected_angle_deg"])],
+                }
+                rx_mode_text = "range_angle_beamformed"
+                angle_method_text = "4_rx_ula_range_angle_beam_scan"
+
+            subject = dict(target)
+            subject.update({
+                "selected_rx": -2,
+                "rx_mode": rx_mode_text,
+                "angle_method": angle_method_text,
+                "angle_remove_static_mean": bool(args.angle_remove_static_mean),
+                "rx_order": ra["rx_order"],
+                "rx_spacing_lambda": float(args.rx_spacing_lambda),
+                "breathing_rate_breaths_per_min": vitals["breathing_rate_breaths_per_min"],
+                "breathing_raw_bin_rate_breaths_per_min": vitals["breathing_raw_bin_rate_breaths_per_min"],
+                "breathing_quality_db": vitals["breathing_quality_db"],
+                "breathing_fft_n": vitals["breathing_fft_n"],
+                "breathing_true_resolution_per_min": vitals["breathing_true_resolution_per_min"],
+                "breathing_padded_spacing_per_min": vitals["breathing_padded_spacing_per_min"],
+                "breathing_interpolation_delta_bins": vitals["breathing_interpolation_delta_bins"],
+                "heart_rate_beats_per_min": vitals["heart_rate_beats_per_min"],
+                "heart_raw_bin_rate_beats_per_min": vitals["heart_raw_bin_rate_beats_per_min"],
+                "heart_quality_db": vitals["heart_quality_db"],
+                "heart_fft_n": vitals["heart_fft_n"],
+                "heart_true_resolution_per_min": vitals["heart_true_resolution_per_min"],
+                "heart_padded_spacing_per_min": vitals["heart_padded_spacing_per_min"],
+                "heart_interpolation_delta_bins": vitals["heart_interpolation_delta_bins"],
+            })
+            subject.update(roi_info)
+            subjects.append(subject)
+
+            if not args.no_save:
+                spaths = _make_subject_output_paths(results_dir, stem, subject["subject_index"])
+                np.save(str(spaths["disp_npy"]), vitals["displacement_m"])
+                np.save(str(spaths["breath_npy"]), vitals["breathing"])
+                np.save(str(spaths["heart_npy"]), vitals["heart"])
+                _write_timeseries_csv(spaths["csv"], time_s, vitals["displacement_m"], vitals["breathing"], vitals["heart"])
+                if args.make_plots:
+                    _save_plots(
+                        spaths,
+                        time_s,
+                        vitals["displacement_m"],
+                        vitals["breathing"],
+                        vitals["heart"],
+                        range_axis_pos,
+                        range_profile,
+                        int(subject["selected_range_bin"]),
+                        has_metric_axis,
+                        vitals["breathing_rate_breaths_per_min"],
+                        vitals["heart_rate_beats_per_min"],
+                    )
+                for key, value in spaths.items():
+                    out_paths_by_name["subject_{:02d}_{}".format(subject["subject_index"], key)] = value
+
+        paths = _make_output_paths(results_dir, stem)
+        if not args.no_save:
+            # Save global range-angle diagnostics.
+            np.save(str(paths["angle_spectrum_npy"]), {
+                "power_map": ra["power_map"],
+                "candidate_bins": ra["candidate_bins"],
+                "angle_grid_reported": ra["angle_grid_reported"],
+                "rx_order": ra["rx_order"],
+            })
+            out_paths_by_name["range_angle_map"] = paths["angle_spectrum_npy"]
+
+    else:
+        selected_angle_deg = None
+        angle_quality_db = None
+        angle_method = "disabled"
+
+        if args.angle_mode == "off":
+            selected_bin = _select_range_bin(
+                range_profile,
+                range_axis_pos,
+                has_metric_axis,
+                float(args.min_range_m),
+                float(args.max_range_m),
+                int(args.min_range_bin),
+                args.max_range_bin,
+            )
+
+            # Original behavior: extract complex slow-time signal at selected range bin.
+            rx_power = np.mean(np.abs(range_fft_pos[:, :, selected_bin]) ** 2, axis=0)
+            selected_rx = int(np.argmax(rx_power))
+
+            if args.rx_mode == "strongest":
+                slow_complex = range_fft_pos[:, selected_rx, selected_bin]
+            elif args.rx_mode == "rx0":
+                selected_rx = 0
+                slow_complex = range_fft_pos[:, 0, selected_bin]
+            elif args.rx_mode == "sum":
+                slow_complex = np.sum(range_fft_pos[:, :, selected_bin], axis=1)
+                selected_rx = -1
+            else:
+                raise ValueError("Unknown rx_mode: {}".format(args.rx_mode))
+        elif args.angle_mode == "beamform":
+            angle_result = _estimate_range_angle_target(
+                range_fft_pos,
+                range_axis_pos,
+                has_metric_axis,
+                args,
+            )
+            slow_complex = angle_result["slow_complex"]
+            selected_bin = int(angle_result["selected_bin"])
+            selected_rx = -2
+            selected_angle_deg = float(angle_result["selected_angle_deg"])
+            angle_quality_db = float(angle_result["angle_quality_db"])
+            angle_method = "4_rx_ula_fft_beam_scan"
+            range_profile = angle_result["range_profile"]
+        else:
+            raise ValueError("Unknown angle_mode: {}".format(args.angle_mode))
+
+        vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
+        selected_range = float(range_axis_pos[selected_bin]) if has_metric_axis else None
+        subjects.append({
+            "subject_index": 1,
+            "selected_range_bin": int(selected_bin),
+            "selected_range_m": selected_range,
+            "selected_angle_deg": selected_angle_deg,
+            "target_quality_db": angle_quality_db,
+            "angle_quality_db": angle_quality_db,
+            "selected_rx": int(selected_rx),
+            "rx_mode": args.rx_mode,
+            "angle_method": angle_method,
+            "breathing_rate_breaths_per_min": vitals["breathing_rate_breaths_per_min"],
+            "breathing_raw_bin_rate_breaths_per_min": vitals["breathing_raw_bin_rate_breaths_per_min"],
+            "breathing_quality_db": vitals["breathing_quality_db"],
+            "breathing_fft_n": vitals["breathing_fft_n"],
+            "breathing_true_resolution_per_min": vitals["breathing_true_resolution_per_min"],
+            "breathing_padded_spacing_per_min": vitals["breathing_padded_spacing_per_min"],
+            "breathing_interpolation_delta_bins": vitals["breathing_interpolation_delta_bins"],
+            "heart_rate_beats_per_min": vitals["heart_rate_beats_per_min"],
+            "heart_raw_bin_rate_beats_per_min": vitals["heart_raw_bin_rate_beats_per_min"],
+            "heart_quality_db": vitals["heart_quality_db"],
+            "heart_fft_n": vitals["heart_fft_n"],
+            "heart_true_resolution_per_min": vitals["heart_true_resolution_per_min"],
+            "heart_padded_spacing_per_min": vitals["heart_padded_spacing_per_min"],
+            "heart_interpolation_delta_bins": vitals["heart_interpolation_delta_bins"],
+        })
+
+        paths = _make_output_paths(results_dir, stem)
+        if not args.no_save:
+            np.save(str(paths["disp_npy"]), vitals["displacement_m"])
+            np.save(str(paths["breath_npy"]), vitals["breathing"])
+            np.save(str(paths["heart_npy"]), vitals["heart"])
+            if angle_result is not None and angle_result.get("angle_spectrum_power") is not None:
+                angle_save = np.vstack([angle_result["angle_grid_deg"], angle_result["angle_spectrum_power"]]).T
+                np.save(str(paths["angle_spectrum_npy"]), angle_save)
+            _write_timeseries_csv(paths["csv"], time_s, vitals["displacement_m"], vitals["breathing"], vitals["heart"])
+            if args.make_plots:
+                _save_plots(
+                    paths,
+                    time_s,
+                    vitals["displacement_m"],
+                    vitals["breathing"],
+                    vitals["heart"],
+                    range_axis_pos,
+                    range_profile,
+                    int(selected_bin),
+                    has_metric_axis,
+                    vitals["breathing_rate_breaths_per_min"],
+                    vitals["heart_rate_beats_per_min"],
+                )
+            out_paths_by_name.update(paths)
 
     results_dir.mkdir(parents=True, exist_ok=True)
     paths = _make_output_paths(results_dir, stem)
 
+    primary = subjects[0] if subjects else {}
     summary = {
         "input_adc_bin_file": str(input_bin_path),
         "intermediate_parsed_file_used": False,
@@ -1764,54 +2489,96 @@ def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path
         "capture_duration_s": float(n_frames / fs_vital),
         "vital_sample_rate_hz": float(fs_vital),
         "range_fft_size": int(range_fft_size),
-        "selected_range_bin": int(selected_bin),
-        "selected_range_m": selected_range,
-        "selected_rx": int(selected_rx),
-        "rx_mode": args.rx_mode,
+        "angle_mode": args.angle_mode,
+        "angle_range_mode": args.angle_range_mode if args.angle_mode in {"beamform", "multi"} else None,
+        "angle_remove_static_mean": bool(args.angle_remove_static_mean) if args.angle_mode in {"beamform", "multi"} else None,
+        "rx_order": subjects[0].get("rx_order", list(range(n_rx))) if subjects else list(range(n_rx)),
+        "rx_spacing_lambda": float(args.rx_spacing_lambda),
+        "num_subjects_detected": int(len(subjects)),
+        "subjects": subjects,
+        # Backward-compatible top-level fields for existing checks.
+        "selected_range_bin": primary.get("selected_range_bin"),
+        "selected_range_m": primary.get("selected_range_m"),
+        "selected_rx": int(primary.get("selected_rx", -999)) if primary else -999,
+        "rx_mode": primary.get("rx_mode", args.rx_mode),
+        "angle_method": primary.get("angle_method"),
+        "selected_angle_deg": primary.get("selected_angle_deg"),
+        "angle_quality_db": primary.get("angle_quality_db", primary.get("target_quality_db")),
         "wavelength_m": float(wavelength),
-        "breathing_rate_breaths_per_min": float(breath_bpm),
-        "breathing_quality_db": float(breath_quality_db),
-        "heart_rate_beats_per_min": float(heart_bpm),
-        "heart_quality_db": float(heart_quality_db),
+        "breathing_rate_breaths_per_min": primary.get("breathing_rate_breaths_per_min"),
+        "breathing_quality_db": primary.get("breathing_quality_db"),
+        "heart_rate_beats_per_min": primary.get("heart_rate_beats_per_min"),
+        "heart_quality_db": primary.get("heart_quality_db"),
         "breathing_band_hz": [float(args.breath_low_hz), float(args.breath_high_hz)],
         "heart_band_hz": [float(args.heart_low_hz), float(args.heart_high_hz)],
+        "vital_frequency_estimation": {
+            "method": "zero_padded_fft_with_quadratic_peak_interpolation" if bool(args.vital_fft_interpolate) else "zero_padded_fft_raw_peak",
+            "zeropad_factor": float(args.vital_fft_zeropad_factor),
+            "minimum_fft_size": int(args.vital_fft_min_size),
+            "true_resolution_per_min": float(60.0 * fs_vital / float(n_frames)),
+            "padded_spacing_per_min": float(60.0 * fs_vital / float(subjects[0].get("breathing_fft_n", max(1, n_frames))) if subjects else float("nan")),
+            "note": "True resolution is limited by capture duration. Zero padding and interpolation improve peak readout, not physical separation of very close rates.",
+        },
+        "target_detection": {
+            "max_subjects": int(args.max_subjects),
+            "target_min_relative_db": float(args.target_min_relative_db),
+            "target_min_quality_db": float(args.target_min_quality_db),
+            "target_min_separation_m": float(args.target_min_separation_m),
+            "target_min_separation_deg": float(args.target_min_separation_deg),
+            "chest_roi_enable": bool(args.chest_roi_enable),
+            "chest_roi_range_m": float(args.chest_roi_range_m),
+            "chest_roi_angle_deg": float(args.chest_roi_angle_deg),
+            "chest_roi_min_relative_db": float(args.chest_roi_min_relative_db),
+            "chest_roi_max_cells": int(args.chest_roi_max_cells),
+            "chest_roi_min_breath_corr": float(args.chest_roi_min_breath_corr),
+        },
         "parser_metadata": metadata,
         "note": "Engineering/prototype estimate only; not for medical diagnosis.",
     }
 
     if not args.no_save:
-        np.save(str(paths["disp_npy"]), displacement_m)
-        np.save(str(paths["breath_npy"]), breathing)
-        np.save(str(paths["heart_npy"]), heart)
-        _write_timeseries_csv(paths["csv"], time_s, displacement_m, breathing, heart)
         with open(str(paths["summary_json"]), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=_json_default)
         with open(str(paths["summary_txt"]), "w", encoding="utf-8") as f:
-            f.write("ADC-to-vital-signs analysis summary\n")
-            f.write("===================================\n")
+            f.write("ADC-to-vital-signs multi-subject analysis summary\n")
+            f.write("=================================================\n")
             for k, v in summary.items():
                 if k == "parser_metadata":
                     f.write("parser_metadata: see JSON summary\n")
+                elif k == "subjects":
+                    f.write("subjects:\n")
+                    for s in subjects:
+                        f.write(
+                            "  subject {idx}: range_bin={rbin}, range_m={rng}, angle_deg={ang}, breath_bpm={bbpm:.2f} raw={braw:.2f}, heart_bpm={hbpm:.2f} raw={hraw:.2f}\n".format(
+                                idx=s.get("subject_index"),
+                                rbin=s.get("selected_range_bin"),
+                                rng=s.get("selected_range_m"),
+                                ang=s.get("selected_angle_deg"),
+                                bbpm=float(s.get("breathing_rate_breaths_per_min", float("nan"))),
+                                braw=float(s.get("breathing_raw_bin_rate_breaths_per_min", float("nan"))),
+                                hbpm=float(s.get("heart_rate_beats_per_min", float("nan"))),
+                                hraw=float(s.get("heart_raw_bin_rate_beats_per_min", float("nan"))),
+                            )
+                        )
+                        if s.get("breathing_true_resolution_per_min") is not None:
+                            f.write("    fft: true_resolution={:.2f}/min, padded_spacing={:.3f}/min, n_fft={}\n".format(
+                                float(s.get("breathing_true_resolution_per_min", float("nan"))),
+                                float(s.get("breathing_padded_spacing_per_min", float("nan"))),
+                                s.get("breathing_fft_n"),
+                            ))
+                        if s.get("roi_enabled"):
+                            f.write("    roi: cells={cells}, range_bins={rbins}, angle={amin}..{amax} deg\n".format(
+                                cells=s.get("roi_cell_count"),
+                                rbins=s.get("roi_range_bins"),
+                                amin=s.get("roi_angle_min_deg"),
+                                amax=s.get("roi_angle_max_deg"),
+                            ))
                 else:
                     f.write("{}: {}\n".format(k, v))
+        out_paths_by_name["summary_json"] = paths["summary_json"]
+        out_paths_by_name["summary_txt"] = paths["summary_txt"]
 
-    if args.make_plots and not args.no_save:
-        _save_plots(
-            paths,
-            time_s,
-            displacement_m,
-            breathing,
-            heart,
-            range_axis_pos,
-            range_profile,
-            selected_bin,
-            has_metric_axis,
-            breath_bpm,
-            heart_bpm,
-        )
-
-    return summary, paths
-
+    return summary, out_paths_by_name
 
 def run_adc_to_vital_signs(args):
     paths = infer_project_paths(
@@ -1881,21 +2648,72 @@ def run_adc_to_vital_signs(args):
     print("Analyzed frames:    {}".format(summary["analyzed_frames"]))
     print("Duration:           {:.2f} s".format(summary["capture_duration_s"]))
     print("Sample rate:        {:.3f} Hz".format(summary["vital_sample_rate_hz"]))
-    if summary["selected_range_m"] is not None:
-        print("Chest range bin:    {} ({:.3f} m)".format(summary["selected_range_bin"], summary["selected_range_m"]))
+    print("Angle mode:         {}".format(summary["angle_mode"]))
+    print("Detected subjects:  {}".format(summary["num_subjects_detected"]))
+    if summary.get("angle_remove_static_mean") is not None:
+        print("AoA static removal: {}".format(summary["angle_remove_static_mean"]))
+        print("RX order:           {}".format(summary["rx_order"]))
+    print("")
+
+    if summary["num_subjects_detected"]:
+        print("Subject results")
+        print("---------------")
+        for subject in summary["subjects"]:
+            rng = subject.get("selected_range_m")
+            rng_text = "{:.3f} m".format(rng) if rng is not None else "bin units"
+            ang = subject.get("selected_angle_deg")
+            ang_text = "{:+.1f} deg".format(ang) if ang is not None else "n/a"
+            print("Subject {:02d}:".format(subject["subject_index"]))
+            print("  Range bin:        {} ({})".format(subject["selected_range_bin"], rng_text))
+            print("  Angle bin:        {}".format(ang_text))
+            if subject.get("roi_enabled"):
+                rr = subject.get("roi_range_bins", [])
+                rtxt = "{}".format(rr)
+                if subject.get("roi_range_min_m") is not None:
+                    rtxt += " ({:.3f}..{:.3f} m)".format(subject.get("roi_range_min_m"), subject.get("roi_range_max_m"))
+                rejected = subject.get("roi_rejected_cell_count")
+                rejected_txt = ", {} rejected".format(rejected) if rejected is not None else ""
+                print("  Chest ROI:        {} cells{}; range bins {}, angle {:+.1f}..{:+.1f} deg".format(
+                    subject.get("roi_cell_count"),
+                    rejected_txt,
+                    rtxt,
+                    subject.get("roi_angle_min_deg"),
+                    subject.get("roi_angle_max_deg"),
+                ))
+            if subject.get("target_relative_power_db") is not None:
+                print("  Target power:     {:+.1f} dB rel, {:.1f} dB quality".format(subject["target_relative_power_db"], subject["target_quality_db"]))
+            print("  Breathing rate:   {:.2f} breaths/min  quality {:.1f} dB".format(subject["breathing_rate_breaths_per_min"], subject["breathing_quality_db"]))
+            if subject.get("breathing_raw_bin_rate_breaths_per_min") is not None:
+                print("    raw FFT bin:    {:.2f} breaths/min; interp delta: {:+.3f} bins".format(
+                    subject["breathing_raw_bin_rate_breaths_per_min"],
+                    subject.get("breathing_interpolation_delta_bins", 0.0),
+                ))
+            print("  Heart rate:       {:.2f} beats/min     quality {:.1f} dB".format(subject["heart_rate_beats_per_min"], subject["heart_quality_db"]))
+            if subject.get("heart_raw_bin_rate_beats_per_min") is not None:
+                print("    raw FFT bin:    {:.2f} beats/min; interp delta: {:+.3f} bins".format(
+                    subject["heart_raw_bin_rate_beats_per_min"],
+                    subject.get("heart_interpolation_delta_bins", 0.0),
+                ))
+            if subject.get("breathing_true_resolution_per_min") is not None:
+                print("  FFT resolution:   true {:.2f}/min; padded spacing {:.3f}/min; Nfft {}".format(
+                    subject["breathing_true_resolution_per_min"],
+                    subject["breathing_padded_spacing_per_min"],
+                    subject.get("breathing_fft_n", "n/a"),
+                ))
     else:
-        print("Chest range bin:    {}".format(summary["selected_range_bin"]))
-    print("Selected RX:        {}".format(summary["selected_rx"] if summary["selected_rx"] >= 0 else "coherent sum"))
-    print("Breathing rate:     {:.2f} breaths/min  quality {:.1f} dB".format(summary["breathing_rate_breaths_per_min"], summary["breathing_quality_db"]))
-    print("Heart rate:         {:.2f} beats/min     quality {:.1f} dB".format(summary["heart_rate_beats_per_min"], summary["heart_quality_db"]))
+        print("No subjects detected. Try lowering --target-min-quality-db, --target-min-relative-db, or widening the range limits.")
+
     print("")
     if args.no_save:
         print("No result files saved because --no-save was used.")
     else:
         print("Saved result files:")
         for p in out_paths.values():
-            if p.exists():
-                print("  {}".format(p))
+            try:
+                if p.exists():
+                    print("  {}".format(p))
+            except AttributeError:
+                pass
 
     return summary
 
@@ -1935,12 +2753,41 @@ def build_combined_arg_parser():
     p.add_argument("--max-range-m", type=float, default=2.0, help="Maximum chest search range in meters.")
     p.add_argument("--min-range-bin", type=int, default=3, help="Ignore bins below this index.")
     p.add_argument("--max-range-bin", type=int, default=None, help="Ignore bins at/above this index.")
-    p.add_argument("--rx-mode", default="strongest", choices=["strongest", "rx0", "sum"], help="RX selection mode.")
+    p.add_argument("--rx-mode", default="strongest", choices=["strongest", "rx0", "sum"], help="RX selection mode used only when --angle-mode off.")
+    p.add_argument("--angle-mode", default="multi", choices=["multi", "beamform", "off"], help="Use multi-subject range-angle beamforming, single-target beamforming, or old RX mode. Default: multi.")
+    p.add_argument("--angle-range-mode", default="selected_range", choices=["selected_range", "range_angle_peak"], help="AoA target selection: scan angle at the strongest range bin, or search the strongest range-angle cell.")
+    p.add_argument("--angle-min-deg", type=float, default=-60.0, help="Minimum azimuth angle to scan in degrees.")
+    p.add_argument("--angle-max-deg", type=float, default=60.0, help="Maximum azimuth angle to scan in degrees.")
+    p.add_argument("--angle-step-deg", type=float, default=1.0, help="Azimuth angle scan step in degrees.")
+    p.add_argument("--rx-spacing-lambda", type=float, default=0.5, help="Assumed RX antenna spacing in wavelengths for the ULA AoA model.")
+    p.add_argument("--rx-order", default=None, help="Optional RX channel order for AoA, for example 0,1,2,3. Use if hardware/channel order is reversed or remapped.")
+    p.add_argument("--invert-angle-sign", action="store_true", help="Invert reported angle sign if left/right appears mirrored.")
+    p.add_argument("--angle-keep-static", dest="angle_remove_static_mean", action="store_false", help="Do not remove the static mean for AoA detection. Default removes static mean so AoA follows the moving chest signal rather than room clutter.")
+    p.set_defaults(angle_remove_static_mean=True)
+    p.add_argument("--max-subjects", type=int, default=4, help="Maximum number of range-angle separated subjects to report in --angle-mode multi.")
+    p.add_argument("--target-min-relative-db", type=float, default=-12.0, help="Reject additional targets more than this many dB below the strongest target. Example: -12 keeps targets within 12 dB.")
+    p.add_argument("--target-min-quality-db", type=float, default=3.0, help="Minimum range-angle peak quality relative to the median range-angle map power.")
+    p.add_argument("--target-min-separation-m", type=float, default=0.25, help="Minimum range separation used for non-maximum suppression between detected subjects.")
+    p.add_argument("--target-min-separation-deg", type=float, default=15.0, help="Minimum angle separation used for non-maximum suppression between detected subjects.")
+    p.add_argument("--allow-same-range-targets", dest="target_suppress_same_range_all_angles", action="store_false", help="Allow multiple detected subjects at the same range but different angles. Default suppresses same-range angular sidelobes.")
+    p.set_defaults(target_suppress_same_range_all_angles=True)
+    p.add_argument("--disable-chest-roi", dest="chest_roi_enable", action="store_false", help="Analyze only the single detected range-angle cell instead of a chest-sized ROI. Default uses ROI in multi mode.")
+    p.set_defaults(chest_roi_enable=True)
+    p.add_argument("--chest-roi-range-m", type=float, default=0.12, help="Half-width of the chest ROI in range around each detected subject. Default: 0.12 m.")
+    p.add_argument("--chest-roi-min-range-bins", type=int, default=1, help="Minimum +/- range bins included in the chest ROI even if the meter width rounds smaller. Default: 1.")
+    p.add_argument("--chest-roi-angle-deg", type=float, default=8.0, help="Half-width of the chest ROI in azimuth around each detected subject. Default: 8 deg.")
+    p.add_argument("--chest-roi-min-relative-db", type=float, default=-10.0, help="Keep ROI cells within this dB level of the local ROI peak. Default: -10 dB.")
+    p.add_argument("--chest-roi-max-cells", type=int, default=25, help="Maximum number of range-angle cells combined per subject ROI. Default: 25.")
+    p.add_argument("--chest-roi-min-breath-corr", type=float, default=0.60, help="Reject ROI cells whose breathing-band motion is weakly correlated with the detected target seed. Default: 0.60.")
     p.add_argument("--drift-window-s", type=float, default=2.0, help="Moving-average drift removal window in seconds.")
     p.add_argument("--breath-low-hz", type=float, default=0.10, help="Breathing band lower cutoff.")
     p.add_argument("--breath-high-hz", type=float, default=0.60, help="Breathing band upper cutoff.")
     p.add_argument("--heart-low-hz", type=float, default=0.80, help="Heart band lower cutoff.")
     p.add_argument("--heart-high-hz", type=float, default=2.00, help="Heart band upper cutoff.")
+    p.add_argument("--vital-fft-zeropad-factor", type=float, default=8.0, help="Zero-padding factor for breathing/heart spectra before peak picking. Default: 8.")
+    p.add_argument("--vital-fft-min-size", type=int, default=8192, help="Minimum FFT length for breathing/heart spectra. Default: 8192.")
+    p.add_argument("--disable-vital-fft-interpolation", dest="vital_fft_interpolate", action="store_false", help="Disable quadratic interpolation around the vital-rate FFT peak.")
+    p.set_defaults(vital_fft_interpolate=True)
     p.add_argument("--make-plots", action="store_true", help="Save PNG plots.")
     p.add_argument("--no-save", action="store_true", help="Do not save any result files; print summary only.")
     p.add_argument("--output-stem", default=None, help="Output filename prefix. Default: ADC bin stem.")

@@ -72,3 +72,5 @@ Items that may be of use later
 
 
 Infromational article on Radar Basics: https://medium.com/@itberrios6/introduction-to-radar-part-2-8a332066917e
+
+Run Python script with: py Data_Procesing\ADC_To_Vital_Signs.py from Root Directory
