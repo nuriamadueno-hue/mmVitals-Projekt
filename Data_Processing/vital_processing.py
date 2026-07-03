@@ -561,43 +561,171 @@ def _estimate_heart_rate_fft(signal, fs, low_hz, high_hz, breathing_rate_bpm, ar
     return baseline
 
 
-def _estimate_rate_trend(displacement_m, fs_vital, args):
-    """Estimate breathing and heart rate over time using sliding windows.
+def _median_filter_1d(values, kernel):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    k = int(kernel)
+    if k <= 1 or arr.size < 3:
+        return arr.copy()
+    if k % 2 == 0:
+        k += 1
+    k = min(k, arr.size if arr.size % 2 == 1 else arr.size - 1)
+    if k <= 1:
+        return arr.copy()
+    half = k // 2
+    out = arr.copy()
+    for i in range(arr.size):
+        lo = max(0, i - half)
+        hi = min(arr.size, i + half + 1)
+        vals = arr[lo:hi]
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            out[i] = float(np.median(vals))
+    return out
 
-    This is primarily a validation visualization, not the primary final estimate.
-    The window and step sizes are user-tunable so the user can trade off temporal
-    tracking against spectral stability.
+def _ema_filter_1d(values, alpha):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    a = float(alpha)
+    if not math.isfinite(a):
+        a = 0.35
+    a = min(1.0, max(0.0, a))
+    out = arr.copy()
+    last = None
+    for i, v in enumerate(arr):
+        if not math.isfinite(float(v)):
+            out[i] = float(last) if last is not None else float('nan')
+            continue
+        if last is None or not math.isfinite(float(last)):
+            last = float(v)
+        else:
+            last = a * float(v) + (1.0 - a) * float(last)
+        out[i] = float(last)
+    return out
+
+def _limit_rate_jumps(values, max_jump_bpm):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size <= 1:
+        return arr.copy()
+    max_jump = abs(float(max_jump_bpm))
+    if not math.isfinite(max_jump) or max_jump <= 0.0:
+        return arr.copy()
+    out = arr.copy()
+    last = None
+    for i, v in enumerate(arr):
+        if not math.isfinite(float(v)):
+            out[i] = float(last) if last is not None else float('nan')
+            continue
+        if last is None or not math.isfinite(float(last)):
+            last = float(v)
+            out[i] = float(v)
+            continue
+        dv = float(v) - float(last)
+        if abs(dv) > max_jump:
+            v = float(last) + math.copysign(max_jump, dv)
+        last = float(v)
+        out[i] = float(v)
+    return out
+
+def _choose_trend_heart_from_candidates(est, prior_bpm, previous_bpm, args):
+    """Choose a window heart-rate candidate for display trend stability.
+
+    The final measurement uses full-capture estimation. This helper is only for the
+    dashboard trend. It prevents the display from jumping between heartbeat,
+    respiration harmonics, and side lobes in short FFT windows.
+    """
+    fallback = float(est.get('heart_rate_beats_per_min', est.get('rate_per_min', float('nan'))) if isinstance(est, dict) else float('nan'))
+    if not isinstance(est, dict):
+        return fallback
+    candidates = est.get('heart_candidates', []) or []
+    if not candidates:
+        return fallback
+
+    max_drop_db = abs(float(getattr(args, 'rate_trend_candidate_max_drop_db', 18.0)))
+    prior_weight = float(getattr(args, 'rate_trend_prior_penalty_db_per_bpm', 0.20))
+    continuity_weight = float(getattr(args, 'rate_trend_continuity_penalty_db_per_bpm', 0.55))
+    harmonic_extra_penalty = float(getattr(args, 'rate_trend_harmonic_extra_penalty_db', 12.0))
+
+    top_q = max(float(c.get('quality_db', -999.0)) for c in candidates)
+    pool = []
+    for c in candidates:
+        q = float(c.get('quality_db', -999.0))
+        if q < top_q - max_drop_db:
+            continue
+        rate = float(c.get('rate_bpm', float('nan')) )
+        if not math.isfinite(rate):
+            continue
+        score = q
+        if bool(c.get('is_breathing_harmonic', False)):
+            score -= harmonic_extra_penalty
+        if prior_bpm is not None and math.isfinite(float(prior_bpm)):
+            score -= prior_weight * abs(rate - float(prior_bpm))
+        if previous_bpm is not None and math.isfinite(float(previous_bpm)):
+            score -= continuity_weight * abs(rate - float(previous_bpm))
+        # Use the candidate score from the harmonic-aware estimator as a secondary signal.
+        score += 0.15 * float(c.get('score_db', q))
+        pool.append((score, q, rate, c))
+    if not pool:
+        return fallback
+    pool.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return float(pool[0][2])
+
+def _estimate_rate_trend(displacement_m, fs_vital, args):
+    """Estimate breathing and heart rate over time for the dashboard.
+
+    This is a visualization trace. The official value remains the full-capture
+    estimate. The trace now uses a longer default window, the full-capture result
+    as a candidate-selection prior, candidate continuity, median smoothing, and jump limiting so the
+    plotted rate does not switch unrealistically between heartbeat, breathing
+    harmonics, and side lobes.
     """
     x = np.asarray(displacement_m, dtype=np.float64)
     n = x.size
+    default_win = 30.0
+    default_step = 2.0
     if n < 8:
         return {
             'time_s': np.array([], dtype=np.float64),
             'breathing_rate_bpm': np.array([], dtype=np.float64),
             'heart_rate_bpm': np.array([], dtype=np.float64),
-            'window_s': float(getattr(args, 'rate_trend_window_s', 15.0)),
-            'step_s': float(getattr(args, 'rate_trend_step_s', 1.0)),
+            'breathing_rate_raw_bpm': np.array([], dtype=np.float64),
+            'heart_rate_raw_bpm': np.array([], dtype=np.float64),
+            'window_s': float(getattr(args, 'rate_trend_window_s', default_win)),
+            'step_s': float(getattr(args, 'rate_trend_step_s', default_step)),
         }
 
-    win_s = max(5.0, float(getattr(args, 'rate_trend_window_s', 15.0)))
-    step_s = max(0.25, float(getattr(args, 'rate_trend_step_s', 1.0)))
+    full_est = _extract_vitals_from_displacement(x, fs_vital, args)
+    full_breath = float(full_est.get('breathing_rate_breaths_per_min', float('nan')))
+    full_heart = float(full_est.get('heart_rate_beats_per_min', float('nan')))
+
+    win_s = max(10.0, float(getattr(args, 'rate_trend_window_s', default_win)))
+    step_s = max(0.5, float(getattr(args, 'rate_trend_step_s', default_step)))
     win_n = max(8, int(round(win_s * float(fs_vital))))
     step_n = max(1, int(round(step_s * float(fs_vital))))
+
+    # If the capture is not longer than the requested window, draw a flat validated
+    # line across the whole recording instead of a single point or noisy short-window trace.
     if win_n >= n:
-        seg = x.copy()
-        est = _extract_vitals_from_displacement(seg, fs_vital, args)
+        t0 = 0.0
+        t1 = max(0.0, (n - 1) / float(fs_vital))
         return {
-            'time_s': np.array([0.5 * n / float(fs_vital)], dtype=np.float64),
-            'breathing_rate_bpm': np.array([float(est['breathing_rate_breaths_per_min'])], dtype=np.float64),
-            'heart_rate_bpm': np.array([float(est['heart_rate_beats_per_min'])], dtype=np.float64),
-            'window_s': float(win_n / float(fs_vital)),
+            'time_s': np.asarray([t0, t1], dtype=np.float64),
+            'breathing_rate_bpm': np.asarray([full_breath, full_breath], dtype=np.float64),
+            'heart_rate_bpm': np.asarray([full_heart, full_heart], dtype=np.float64),
+            'breathing_rate_raw_bpm': np.asarray([full_breath, full_breath], dtype=np.float64),
+            'heart_rate_raw_bpm': np.asarray([full_heart, full_heart], dtype=np.float64),
+            'window_s': float(n / float(fs_vital)),
             'step_s': float(step_n / float(fs_vital)),
         }
 
     centers = []
-    breath_rates = []
-    heart_rates = []
+    breath_raw = []
+    heart_raw = []
+    heart_cont = []
     half = win_n // 2
+    prev_heart = full_heart if math.isfinite(float(full_heart)) else None
     for center in range(half, n - (win_n - half) + 1, step_n):
         start = center - half
         stop = start + win_n
@@ -605,14 +733,54 @@ def _estimate_rate_trend(displacement_m, fs_vital, args):
         if seg.size < 8:
             continue
         est = _extract_vitals_from_displacement(seg, fs_vital, args)
+        br = float(est['breathing_rate_breaths_per_min'])
+        hr_raw = float(est['heart_rate_beats_per_min'])
+        hr = _choose_trend_heart_from_candidates(est, full_heart, prev_heart, args)
         centers.append((start + 0.5 * seg.size) / float(fs_vital))
-        breath_rates.append(float(est['breathing_rate_breaths_per_min']))
-        heart_rates.append(float(est['heart_rate_beats_per_min']))
+        breath_raw.append(br)
+        heart_raw.append(hr_raw)
+        heart_cont.append(hr)
+        if math.isfinite(float(hr)):
+            prev_heart = float(hr)
+
+    t = np.asarray(centers, dtype=np.float64)
+    b_raw = np.asarray(breath_raw, dtype=np.float64)
+    h_raw = np.asarray(heart_raw, dtype=np.float64)
+    h = np.asarray(heart_cont, dtype=np.float64)
+
+    # Smooth the display trend. The median filter removes isolated window errors;
+    # the jump limiter and EMA remove non-physiological display jumps.
+    kernel_s = max(0.0, float(getattr(args, 'rate_trend_median_s', 6.0)))
+    kernel_n = int(round(kernel_s / max(step_s, 1e-9))) if kernel_s > 0.0 else 1
+    if kernel_n % 2 == 0:
+        kernel_n += 1
+    h = _median_filter_1d(h, kernel_n)
+    b = _median_filter_1d(b_raw, kernel_n)
+
+    max_jump_per_s = max(0.0, float(getattr(args, 'rate_trend_max_jump_bpm_per_s', 2.0)))
+    max_jump = max_jump_per_s * step_s
+    h = _limit_rate_jumps(h, max_jump)
+    b = _limit_rate_jumps(b, max(1.0, 0.75 * max_jump))
+
+    ema_alpha = float(getattr(args, 'rate_trend_ema_alpha', 0.35))
+    h = _ema_filter_1d(h, ema_alpha)
+    b = _ema_filter_1d(b, ema_alpha)
+
+    # Optional display blend toward the robust full-capture estimate.
+    # Default is 0.0 so the dashboard shows the actual 30 s sliding-window trend.
+    # Increase this only for a deliberately more stable display.
+    blend = min(1.0, max(0.0, float(getattr(args, 'rate_trend_full_capture_blend', 0.00))))
+    if math.isfinite(full_heart):
+        h = (1.0 - blend) * h + blend * full_heart
+    if math.isfinite(full_breath):
+        b = (1.0 - min(0.50, blend)) * b + min(0.50, blend) * full_breath
 
     return {
-        'time_s': np.asarray(centers, dtype=np.float64),
-        'breathing_rate_bpm': np.asarray(breath_rates, dtype=np.float64),
-        'heart_rate_bpm': np.asarray(heart_rates, dtype=np.float64),
+        'time_s': t,
+        'breathing_rate_bpm': np.asarray(b, dtype=np.float64),
+        'heart_rate_bpm': np.asarray(h, dtype=np.float64),
+        'breathing_rate_raw_bpm': b_raw,
+        'heart_rate_raw_bpm': h_raw,
         'window_s': float(win_n / float(fs_vital)),
         'step_s': float(step_n / float(fs_vital)),
     }
@@ -1146,8 +1314,8 @@ def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path
             "chest_roi_min_breath_corr": float(args.chest_roi_min_breath_corr),
         },
         "rate_trend_estimation": {
-            "window_s": float(getattr(args, "rate_trend_window_s", 15.0)),
-            "step_s": float(getattr(args, "rate_trend_step_s", 1.0)),
+            "window_s": float(getattr(args, "rate_trend_window_s", 30.0)),
+            "step_s": float(getattr(args, "rate_trend_step_s", 2.0)),
             "note": "Sliding-window trend used for validation plots; final reported rates still come from the full analyzed capture.",
         },
         "parser_metadata": metadata,
