@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Auto-split from ADC_To_Vital_Signs.py.
-# Keep Python 3.8 compatibility.
-
+"""Shared constants, dataclasses, and parsing helpers."""
 from __future__ import annotations
 
 import argparse

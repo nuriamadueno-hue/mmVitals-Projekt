@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Metadata helpers split from ADC_To_Vital_Signs.py.
-
+"""Small helpers for reading numeric values from nested metadata."""
 from common import *
 
 def _safe_float(value, default=None):
@@ -10,40 +9,6 @@ def _safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
-
-def _decode_metadata(value):
-    """Load metadata saved as dict, JSON string, bytes, or numpy scalar."""
-    if value is None:
-        return {}
-
-    try:
-        if isinstance(value, np.ndarray):
-            if value.shape == ():
-                value = value.item()
-            elif value.size == 1:
-                value = value.reshape(-1)[0]
-            else:
-                return {}
-    except Exception:
-        pass
-
-    if isinstance(value, bytes):
-        try:
-            value = value.decode("utf-8")
-        except Exception:
-            return {}
-
-    if isinstance(value, str):
-        try:
-            loaded = json.loads(value)
-            return loaded if isinstance(loaded, dict) else {}
-        except Exception:
-            return {}
-
-    if isinstance(value, dict):
-        return value
-
-    return {}
 
 def _flatten_metadata(metadata):
     """Flatten a nested metadata/config dictionary for easier key lookup."""

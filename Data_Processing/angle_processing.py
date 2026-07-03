@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Auto-split from ADC_To_Vital_Signs.py.
-# Keep Python 3.8 compatibility.
-
+"""Range/azimuth subject detection and ROI beamforming."""
 from common import *
 from range_processing import *
 
@@ -257,66 +255,6 @@ def _beamform_slow_complex_for_cell(range_fft_pos, range_bin, angle_internal_deg
     x_target = range_fft_pos[:, rx_order, int(range_bin)]
     steer = _steering_vector_ula(n_rx, float(angle_internal_deg), float(rx_spacing_lambda))
     return x_target @ (np.conj(steer) / float(n_rx))
-
-def _estimate_range_angle_target(range_fft_pos, range_axis_pos, has_metric_axis, args):
-    """Backward-compatible single-target AoA selection."""
-    ra = _compute_range_angle_map(range_fft_pos, range_axis_pos, has_metric_axis, args)
-
-    if args.angle_range_mode == "selected_range":
-        # Retain the older behavior: choose strongest range first, then scan angles only at that range.
-        range_profile = ra["range_profile"]
-        selected_bin = _select_range_bin(
-            range_profile,
-            range_axis_pos,
-            has_metric_axis,
-            float(args.min_range_m),
-            float(args.max_range_m),
-            int(args.min_range_bin),
-            args.max_range_bin,
-        )
-        candidate_bins = np.asarray([selected_bin], dtype=int)
-        old_candidates = ra["candidate_bins"]
-        idx = np.where(old_candidates == selected_bin)[0]
-        if idx.size:
-            power_map = ra["power_map"][idx, :]
-        else:
-            # Fallback should rarely be used.
-            power_map = ra["power_map"][:1, :]
-        ra_single = dict(ra)
-        ra_single["candidate_bins"] = candidate_bins
-        ra_single["power_map"] = power_map
-        targets = _detect_range_angle_targets(ra_single, range_axis_pos, has_metric_axis, args)
-    elif args.angle_range_mode == "range_angle_peak":
-        targets = _detect_range_angle_targets(ra, range_axis_pos, has_metric_axis, args)
-    else:
-        raise ValueError("Unknown angle_range_mode: {}".format(args.angle_range_mode))
-
-    if not targets:
-        raise ValueError("No range-angle target was detected. Try lowering --target-min-quality-db or widening the range limits.")
-
-    target = targets[0]
-    slow_complex = _beamform_slow_complex_for_target(range_fft_pos, target, ra["rx_order"], ra["rx_spacing_lambda"])
-
-    # Spectrum at selected range for diagnostics.
-    rbin = int(target["selected_range_bin"])
-    r_local_matches = np.where(ra["candidate_bins"] == rbin)[0]
-    angle_spectrum = None
-    if r_local_matches.size:
-        angle_spectrum = ra["power_map"][int(r_local_matches[0]), :]
-
-    return {
-        "slow_complex": slow_complex,
-        "selected_bin": int(target["selected_range_bin"]),
-        "selected_angle_deg": float(target["selected_angle_deg"]),
-        "internal_angle_deg": float(target["internal_angle_deg"]),
-        "angle_quality_db": float(target["target_quality_db"]),
-        "angle_grid_deg": ra["angle_grid_reported"],
-        "angle_spectrum_power": angle_spectrum,
-        "range_profile": ra["range_profile"],
-        "rx_order": ra["rx_order"],
-        "rx_spacing_lambda": ra["rx_spacing_lambda"],
-        "angle_range_mode": args.angle_range_mode,
-    }
 
 def _detect_multi_subjects(range_fft_pos, range_axis_pos, has_metric_axis, args):
     ra = _compute_range_angle_map(range_fft_pos, range_axis_pos, has_metric_axis, args)

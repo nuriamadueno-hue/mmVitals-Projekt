@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Auto-split from ADC_To_Vital_Signs.py.
-# Keep Python 3.8 compatibility.
-
+"""mmWave Studio configuration discovery and decoding."""
 from common import *
 
 def infer_project_paths(
@@ -52,19 +50,16 @@ def _iter_matching_files(base: Path, patterns: Iterable[str], *, recursive: bool
             seen.add(resolved)
     return unique
 
+
 def _score_bin_file(path: Path) -> Tuple[int, int, str]:
+    """Prefer normal ADC captures over small/log-like binary files."""
     name = path.name.lower()
-    score = 0
-    if "raw" in name:
-        score += 1000
-    if "log" in name:
-        score += 1000
-    if name.startswith("adc_data") or name.startswith("adc"):
-        score -= 50
-    if path.parent.name.lower() == "adc_recorded_data":
-        score -= 25
-    # Prefer larger capture if otherwise similar.
-    return score, -path.stat().st_size, str(path)
+    penalty = 0
+    if "adc" not in name:
+        penalty += 5
+    if "test" in name:
+        penalty += 2
+    return penalty, -path.stat().st_size, name
 
 def find_bin_file(data_dir: Path) -> Path:
     patterns = ["*.bin"]

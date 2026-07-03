@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Auto-split from ADC_To_Vital_Signs.py.
-# Keep Python 3.8 compatibility.
-
+"""Breathing and heart-rate extraction from radar phase motion."""
 from common import *
 from range_processing import *
 from angle_processing import *
@@ -14,40 +12,6 @@ def _safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
-
-def _decode_metadata(value):
-    """Load metadata saved as dict, JSON string, bytes, or numpy scalar."""
-    if value is None:
-        return {}
-
-    try:
-        if isinstance(value, np.ndarray):
-            if value.shape == ():
-                value = value.item()
-            elif value.size == 1:
-                value = value.reshape(-1)[0]
-            else:
-                return {}
-    except Exception:
-        pass
-
-    if isinstance(value, bytes):
-        try:
-            value = value.decode("utf-8")
-        except Exception:
-            return {}
-
-    if isinstance(value, str):
-        try:
-            loaded = json.loads(value)
-            return loaded if isinstance(loaded, dict) else {}
-        except Exception:
-            return {}
-
-    if isinstance(value, dict):
-        return value
-
-    return {}
 
 def _flatten_metadata(metadata):
     """Flatten a nested metadata/config dictionary for easier key lookup."""
@@ -74,38 +38,6 @@ def _meta_get_float(metadata, keys, default=None):
             if val is not None:
                 return val
     return default
-
-def _find_latest_parsed_file(prelim_dir):
-    files = sorted(prelim_dir.glob("*_parsed.npz"))
-    if not files:
-        raise FileNotFoundError("No *_parsed.npz file found in: {}".format(prelim_dir))
-    return files[-1]
-
-def _get_project_root_from_script():
-    # Script normally lives in mmWave_Studio/Data_Processing/
-    return Path(__file__).resolve().parents[1]
-
-def _load_parsed_npz(path):
-    data = np.load(str(path), allow_pickle=True)
-
-    if "cube_frames" in data:
-        cube_frames = data["cube_frames"]
-    elif "cube_chirps" in data:
-        cube_chirps = data["cube_chirps"]
-        raise ValueError(
-            "Input contains cube_chirps but not cube_frames. "
-            "For vital signs, run the parser so it outputs complete cube_frames."
-        )
-    else:
-        raise KeyError("Parsed file does not contain cube_frames.")
-
-    metadata = {}
-    if "metadata" in data:
-        metadata = _decode_metadata(data["metadata"])
-    elif "config" in data:
-        metadata = _decode_metadata(data["config"])
-
-    return cube_frames, metadata
 
 def _derive_wavelength(metadata):
     start_freq_ghz = _meta_get_float(
@@ -200,59 +132,6 @@ def _bandpass_filter(signal, fs, low_hz, high_hz, args=None):
 # Backward-compatible name used by existing ROI code.
 def _fft_bandpass(signal, fs, low_hz, high_hz, args=None):
     return _bandpass_filter(signal, fs, low_hz, high_hz, args=args)
-
-def _parse_reference_list(text):
-    if text is None or str(text).strip() == "":
-        return []
-    vals = []
-    for part in str(text).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            vals.append(float(part))
-        except Exception:
-            vals.append(None)
-    return vals
-
-def _reference_for_subject(args, subject_index, kind):
-    idx = int(subject_index)
-    if kind == "breath":
-        explicit = getattr(args, "reference_breath_subject_{}".format(idx), None)
-        vals = _parse_reference_list(getattr(args, "reference_breath_rates", None))
-    else:
-        explicit = getattr(args, "reference_heart_subject_{}".format(idx), None)
-        vals = _parse_reference_list(getattr(args, "reference_heart_rates", None))
-    if explicit is not None:
-        return float(explicit)
-    if 0 <= idx - 1 < len(vals) and vals[idx - 1] is not None:
-        return float(vals[idx - 1])
-    return None
-
-def _add_validation_and_vital_score(subject, args):
-    """Add reference error fields and a separate vital quality score after vital extraction."""
-    bq = float(subject.get("breathing_quality_db", float("nan")))
-    hq = float(subject.get("heart_quality_db", float("nan")))
-    finite = [x for x in [bq, hq] if math.isfinite(x)]
-    subject["vital_score_db"] = float(sum(finite) / len(finite)) if finite else None
-    subject["detection_score_db"] = subject.get("detection_quality_db", subject.get("target_quality_db"))
-
-    ref_b = _reference_for_subject(args, subject.get("subject_index", 1), "breath")
-    ref_h = _reference_for_subject(args, subject.get("subject_index", 1), "heart")
-    validation = {}
-    if ref_b is not None:
-        est = float(subject.get("breathing_rate_breaths_per_min", float("nan")))
-        validation["reference_breathing_rate_breaths_per_min"] = float(ref_b)
-        validation["breathing_error_breaths_per_min"] = float(est - ref_b) if math.isfinite(est) else None
-        validation["breathing_abs_error_breaths_per_min"] = abs(float(est - ref_b)) if math.isfinite(est) else None
-    if ref_h is not None:
-        est = float(subject.get("heart_rate_beats_per_min", float("nan")))
-        validation["reference_heart_rate_beats_per_min"] = float(ref_h)
-        validation["heart_error_beats_per_min"] = float(est - ref_h) if math.isfinite(est) else None
-        validation["heart_abs_error_beats_per_min"] = abs(float(est - ref_h)) if math.isfinite(est) else None
-    if validation:
-        subject["validation"] = validation
-    return subject
 
 def _quadratic_peak_interpolation(power, peak_idx):
     """Return sub-bin peak offset using a quadratic fit around the FFT peak.
@@ -930,32 +809,23 @@ def _extract_vitals_from_subject_roi(range_fft_pos, target, ra, range_axis_pos, 
     return vitals, roi_info
 
 def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path, results_dir, stem):
-    """Run the vital-sign algorithm directly from an in-memory parsed cube.
+    """Estimate vital signs and create the dashboard data.
 
-    Supports either one target or multiple range-angle separated subjects.
-    cube_frames shape: (frames, chirps_per_frame, rx, adc_samples)
-    metadata: parser metadata dictionary returned by read_dca1000_adc_bin(...)
+    The minimal application always runs the 2D range/azimuth multi-subject
+    pipeline. It keeps one slow-time sample per frame, detects subjects in a
+    range-angle motion map, builds a chest ROI for each subject, and estimates
+    breathing and heart rate from phase motion.
     """
     if cube_frames.ndim != 4:
-        raise ValueError(
-            "cube_frames must have 4 dimensions: (frames, chirps, rx, samples). Got shape {}".format(cube_frames.shape)
-        )
+        raise ValueError("cube_frames must have shape (frames, chirps, rx, samples)")
 
-    n_frames_total, n_chirps, n_rx, n_samples = cube_frames.shape
-
-    frame_start = max(0, int(args.frame_start))
-    if args.frame_count is None:
-        frame_end = n_frames_total
-    else:
-        frame_end = min(n_frames_total, frame_start + int(args.frame_count))
-
-    if frame_end <= frame_start:
-        raise ValueError("Invalid frame range: start={}, end={}".format(frame_start, frame_end))
-
+    n_frames_total, _, _, n_samples = cube_frames.shape
+    frame_start = 0
+    frame_end = n_frames_total
     cube = cube_frames[frame_start:frame_end]
     n_frames = cube.shape[0]
 
-    fs_vital = float(args.fs) if args.fs else _derive_frame_rate(metadata, fallback=20.0)
+    fs_vital = _derive_frame_rate(metadata, fallback=20.0)
     wavelength = _derive_wavelength(metadata)
 
     range_fft_size = int(args.range_fft_size)
@@ -964,406 +834,80 @@ def analyze_vital_signs_from_cube(cube_frames, metadata, args, *, input_bin_path
 
     range_axis, has_metric_axis = _derive_range_axis(metadata, range_fft_size, n_samples)
 
-    # Average chirps within each frame: one slow-time sample per frame.
+    # One slow-time sample per frame is required for vital signs.
     frame_adc = cube.mean(axis=1)
-
-    # Remove static ADC DC bias over samples for each frame/RX.
     frame_adc = frame_adc - frame_adc.mean(axis=2, keepdims=True)
 
     window = _hann(n_samples).astype(np.float32)
     range_fft = np.fft.fft(frame_adc * window[None, None, :], n=range_fft_size, axis=2)
 
-    # Use only positive range bins.
     half = range_fft_size // 2
     range_fft_pos = range_fft[:, :, :half]
     range_axis_pos = range_axis[:half]
 
-    range_profile = np.mean(np.abs(range_fft_pos), axis=(0, 1))
-    time_s = np.arange(n_frames, dtype=np.float64) / fs_vital
-
+    targets, range_angle = _detect_multi_subjects(range_fft_pos, range_axis_pos, has_metric_axis, args)
     subjects = []
-    angle_result = None
-    out_paths_by_name = {}
 
-    if args.angle_mode == "multi":
-        targets, ra = _detect_multi_subjects(range_fft_pos, range_axis_pos, has_metric_axis, args)
-        range_profile = ra["range_profile"]
-        for target in targets:
-            if bool(args.chest_roi_enable):
-                vitals, roi_info = _extract_vitals_from_subject_roi(
-                    range_fft_pos,
-                    target,
-                    ra,
-                    range_axis_pos,
-                    has_metric_axis,
-                    fs_vital,
-                    wavelength,
-                    args,
-                )
-                rx_mode_text = "range_angle_roi_beamformed"
-                angle_method_text = "4_rx_ula_range_angle_roi_beam_scan"
-            else:
-                slow_complex = _beamform_slow_complex_for_target(
-                    range_fft_pos,
-                    target,
-                    ra["rx_order"],
-                    ra["rx_spacing_lambda"],
-                )
-                vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
-                roi_info = {
-                    "roi_enabled": False,
-                    "roi_cell_count": 1,
-                    "roi_range_bins": [int(target["selected_range_bin"])],
-                    "roi_angle_bins_deg": [float(target["selected_angle_deg"])],
-                }
-                rx_mode_text = "range_angle_beamformed"
-                angle_method_text = "4_rx_ula_range_angle_beam_scan"
-
-            subject = dict(target)
-            trend = _estimate_rate_trend(vitals["displacement_m"], fs_vital, args)
-            subject.update({
-                "selected_rx": -2,
-                "rx_mode": rx_mode_text,
-                "angle_method": angle_method_text,
-                "angle_remove_static_mean": bool(args.angle_remove_static_mean),
-                "rx_order": ra["rx_order"],
-                "rx_spacing_lambda": float(args.rx_spacing_lambda),
-                "rate_trend_time_s": trend["time_s"],
-                "rate_trend_breath_bpm": trend["breathing_rate_bpm"],
-                "rate_trend_heart_bpm": trend["heart_rate_bpm"],
-                "rate_trend_window_s": trend["window_s"],
-                "rate_trend_step_s": trend["step_s"],
-                "breathing_rate_breaths_per_min": vitals["breathing_rate_breaths_per_min"],
-                "breathing_raw_bin_rate_breaths_per_min": vitals["breathing_raw_bin_rate_breaths_per_min"],
-                "breathing_quality_db": vitals["breathing_quality_db"],
-                "breathing_fft_n": vitals["breathing_fft_n"],
-                "breathing_true_resolution_per_min": vitals["breathing_true_resolution_per_min"],
-                "breathing_padded_spacing_per_min": vitals["breathing_padded_spacing_per_min"],
-                "breathing_interpolation_delta_bins": vitals["breathing_interpolation_delta_bins"],
-                "heart_rate_beats_per_min": vitals["heart_rate_beats_per_min"],
-                "heart_raw_bin_rate_beats_per_min": vitals["heart_raw_bin_rate_beats_per_min"],
-                "heart_quality_db": vitals["heart_quality_db"],
-                "heart_fft_n": vitals["heart_fft_n"],
-                "heart_true_resolution_per_min": vitals["heart_true_resolution_per_min"],
-                "heart_padded_spacing_per_min": vitals["heart_padded_spacing_per_min"],
-                "heart_interpolation_delta_bins": vitals["heart_interpolation_delta_bins"],
-                "heart_peak_selection_method": vitals.get("heart_peak_selection_method"),
-                "heart_candidates": vitals.get("heart_candidates", []),
-                "heart_harmonic_warning": bool(vitals.get("heart_harmonic_warning", False)),
-                "heart_nearest_breath_harmonic_order": vitals.get("heart_nearest_breath_harmonic_order"),
-                "heart_nearest_breath_harmonic_bpm": vitals.get("heart_nearest_breath_harmonic_bpm"),
-                "heart_nearest_breath_harmonic_distance_bpm": vitals.get("heart_nearest_breath_harmonic_distance_bpm"),
-            })
-            subject.update(roi_info)
-            _add_validation_and_vital_score(subject, args)
-            subjects.append(subject)
-
-            if not args.no_save:
-                spaths = _make_subject_output_paths(results_dir, stem, subject["subject_index"])
-                np.save(str(spaths["disp_npy"]), vitals["displacement_m"])
-                np.save(str(spaths["breath_npy"]), vitals["breathing"])
-                np.save(str(spaths["heart_npy"]), vitals["heart"])
-                _write_timeseries_csv(spaths["csv"], time_s, vitals["displacement_m"], vitals["breathing"], vitals["heart"])
-                _write_rate_trend_csv(spaths["rate_trend_csv"], trend["time_s"], trend["breathing_rate_bpm"], trend["heart_rate_bpm"])
-                if args.make_plots:
-                    _save_plots(
-                        spaths,
-                        time_s,
-                        vitals["displacement_m"],
-                        vitals["breathing"],
-                        vitals["heart"],
-                        range_axis_pos,
-                        range_profile,
-                        int(subject["selected_range_bin"]),
-                        has_metric_axis,
-                        vitals["breathing_rate_breaths_per_min"],
-                        vitals["heart_rate_beats_per_min"],
-                    )
-                    _save_vital_spectrum_plot(
-                        spaths["spectrum_plot"],
-                        vitals,
-                        float(args.breath_low_hz),
-                        float(args.breath_high_hz),
-                        float(args.heart_low_hz),
-                        float(args.heart_high_hz),
-                    )
-                    _save_roi_diagnostic_plot(
-                        spaths["roi_plot"],
-                        subject,
-                        ra,
-                        range_axis_pos,
-                        has_metric_axis,
-                    )
-                for key, value in spaths.items():
-                    out_paths_by_name["subject_{:02d}_{}".format(subject["subject_index"], key)] = value
-
-        paths = _make_output_paths(results_dir, stem)
-        if not args.no_save:
-            # Save global range-angle diagnostics.
-            np.save(str(paths["angle_spectrum_npy"]), {
-                "power_map": ra["power_map"],
-                "candidate_bins": ra["candidate_bins"],
-                "angle_grid_reported": ra["angle_grid_reported"],
-                "rx_order": ra["rx_order"],
-            })
-            out_paths_by_name["range_angle_map"] = paths["angle_spectrum_npy"]
-            if args.make_plots:
-                _save_range_angle_map_plot(paths["range_angle_plot"], ra, range_axis_pos, has_metric_axis, subjects)
-                _save_subject_comparison_plot(paths["subject_comparison_plot"], subjects)
-                _save_validation_dashboard_plot(
-                    paths["dashboard_plot"],
-                    subjects,
-                    ra,
-                    range_axis_pos,
-                    has_metric_axis,
-                    show_window=False,
-                    gui_backend=getattr(args, "gui_backend", None),
-                )
-                out_paths_by_name["range_angle_plot"] = paths["range_angle_plot"]
-                out_paths_by_name["subject_comparison_plot"] = paths["subject_comparison_plot"]
-                out_paths_by_name["dashboard_plot"] = paths["dashboard_plot"]
-
-    else:
-        selected_angle_deg = None
-        angle_quality_db = None
-        angle_method = "disabled"
-
-        if args.angle_mode == "off":
-            selected_bin = _select_range_bin(
-                range_profile,
-                range_axis_pos,
-                has_metric_axis,
-                float(args.min_range_m),
-                float(args.max_range_m),
-                int(args.min_range_bin),
-                args.max_range_bin,
-            )
-
-            # Original behavior: extract complex slow-time signal at selected range bin.
-            rx_power = np.mean(np.abs(range_fft_pos[:, :, selected_bin]) ** 2, axis=0)
-            selected_rx = int(np.argmax(rx_power))
-
-            if args.rx_mode == "strongest":
-                slow_complex = range_fft_pos[:, selected_rx, selected_bin]
-            elif args.rx_mode == "rx0":
-                selected_rx = 0
-                slow_complex = range_fft_pos[:, 0, selected_bin]
-            elif args.rx_mode == "sum":
-                slow_complex = np.sum(range_fft_pos[:, :, selected_bin], axis=1)
-                selected_rx = -1
-            else:
-                raise ValueError("Unknown rx_mode: {}".format(args.rx_mode))
-        elif args.angle_mode == "beamform":
-            angle_result = _estimate_range_angle_target(
+    for target in targets:
+        if bool(args.chest_roi_enable):
+            vitals, roi_info = _extract_vitals_from_subject_roi(
                 range_fft_pos,
+                target,
+                range_angle,
                 range_axis_pos,
                 has_metric_axis,
+                fs_vital,
+                wavelength,
                 args,
             )
-            slow_complex = angle_result["slow_complex"]
-            selected_bin = int(angle_result["selected_bin"])
-            selected_rx = -2
-            selected_angle_deg = float(angle_result["selected_angle_deg"])
-            angle_quality_db = float(angle_result["angle_quality_db"])
-            angle_method = "4_rx_ula_fft_beam_scan"
-            range_profile = angle_result["range_profile"]
+            angle_method = "range-angle ROI beamforming"
         else:
-            raise ValueError("Unknown angle_mode: {}".format(args.angle_mode))
+            slow_complex = _beamform_slow_complex_for_target(
+                range_fft_pos, target, range_angle["rx_order"], range_angle["rx_spacing_lambda"]
+            )
+            vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
+            roi_info = {"roi_enabled": False, "roi_cell_count": 1, "roi_cells": [], "roi_rejected_cells": []}
+            angle_method = "range-angle beamforming"
 
-        vitals = _extract_vitals_from_slow_complex(slow_complex, fs_vital, wavelength, args)
-        selected_range = float(range_axis_pos[selected_bin]) if has_metric_axis else None
         trend = _estimate_rate_trend(vitals["displacement_m"], fs_vital, args)
-        subjects.append({
-            "subject_index": 1,
-            "selected_range_bin": int(selected_bin),
+        subject = dict(target)
+        subject.update(roi_info)
+        subject.update({
+            "angle_method": angle_method,
+            "rx_order": range_angle["rx_order"],
+            "rx_spacing_lambda": float(args.rx_spacing_lambda),
             "rate_trend_time_s": trend["time_s"],
             "rate_trend_breath_bpm": trend["breathing_rate_bpm"],
             "rate_trend_heart_bpm": trend["heart_rate_bpm"],
             "rate_trend_window_s": trend["window_s"],
             "rate_trend_step_s": trend["step_s"],
-            "selected_range_m": selected_range,
-            "selected_angle_deg": selected_angle_deg,
-            "target_quality_db": angle_quality_db,
-            "angle_quality_db": angle_quality_db,
-            "selected_rx": int(selected_rx),
-            "rx_mode": args.rx_mode,
-            "angle_method": angle_method,
             "breathing_rate_breaths_per_min": vitals["breathing_rate_breaths_per_min"],
-            "breathing_raw_bin_rate_breaths_per_min": vitals["breathing_raw_bin_rate_breaths_per_min"],
             "breathing_quality_db": vitals["breathing_quality_db"],
-            "breathing_fft_n": vitals["breathing_fft_n"],
-            "breathing_true_resolution_per_min": vitals["breathing_true_resolution_per_min"],
-            "breathing_padded_spacing_per_min": vitals["breathing_padded_spacing_per_min"],
-            "breathing_interpolation_delta_bins": vitals["breathing_interpolation_delta_bins"],
             "heart_rate_beats_per_min": vitals["heart_rate_beats_per_min"],
-            "heart_raw_bin_rate_beats_per_min": vitals["heart_raw_bin_rate_beats_per_min"],
             "heart_quality_db": vitals["heart_quality_db"],
-            "heart_fft_n": vitals["heart_fft_n"],
-            "heart_true_resolution_per_min": vitals["heart_true_resolution_per_min"],
-            "heart_padded_spacing_per_min": vitals["heart_padded_spacing_per_min"],
-            "heart_interpolation_delta_bins": vitals["heart_interpolation_delta_bins"],
             "heart_peak_selection_method": vitals.get("heart_peak_selection_method"),
-            "heart_candidates": vitals.get("heart_candidates", []),
             "heart_harmonic_warning": bool(vitals.get("heart_harmonic_warning", False)),
-            "heart_nearest_breath_harmonic_order": vitals.get("heart_nearest_breath_harmonic_order"),
-            "heart_nearest_breath_harmonic_bpm": vitals.get("heart_nearest_breath_harmonic_bpm"),
-            "heart_nearest_breath_harmonic_distance_bpm": vitals.get("heart_nearest_breath_harmonic_distance_bpm"),
         })
-
-        paths = _make_output_paths(results_dir, stem)
-        if not args.no_save:
-            np.save(str(paths["disp_npy"]), vitals["displacement_m"])
-            np.save(str(paths["breath_npy"]), vitals["breathing"])
-            np.save(str(paths["heart_npy"]), vitals["heart"])
-            if angle_result is not None and angle_result.get("angle_spectrum_power") is not None:
-                angle_save = np.vstack([angle_result["angle_grid_deg"], angle_result["angle_spectrum_power"]]).T
-                np.save(str(paths["angle_spectrum_npy"]), angle_save)
-            _write_timeseries_csv(paths["csv"], time_s, vitals["displacement_m"], vitals["breathing"], vitals["heart"])
-            _write_rate_trend_csv(paths["rate_trend_csv"], trend["time_s"], trend["breathing_rate_bpm"], trend["heart_rate_bpm"])
-            if args.make_plots:
-                _save_plots(
-                    paths,
-                    time_s,
-                    vitals["displacement_m"],
-                    vitals["breathing"],
-                    vitals["heart"],
-                    range_axis_pos,
-                    range_profile,
-                    int(selected_bin),
-                    has_metric_axis,
-                    vitals["breathing_rate_breaths_per_min"],
-                    vitals["heart_rate_beats_per_min"],
-                )
-            out_paths_by_name.update(paths)
-
-    for _subject in subjects:
-        if "vital_score_db" not in _subject:
-            _add_validation_and_vital_score(_subject, args)
+        subjects.append(subject)
 
     results_dir.mkdir(parents=True, exist_ok=True)
     paths = _make_output_paths(results_dir, stem)
+    _save_validation_dashboard_plot(
+        paths["dashboard_plot"],
+        subjects,
+        range_angle,
+        range_axis_pos,
+        has_metric_axis,
+        show_window=False,
+        gui_backend=getattr(args, "gui_backend", None),
+    )
 
-    primary = subjects[0] if subjects else {}
     summary = {
         "input_adc_bin_file": str(input_bin_path),
-        "intermediate_parsed_file_used": False,
-        "cube_frames_shape_total": list(cube_frames.shape),
-        "analyzed_frame_start": frame_start,
-        "analyzed_frame_end_exclusive": frame_end,
-        "analyzed_frames": n_frames,
         "capture_duration_s": float(n_frames / fs_vital),
         "vital_sample_rate_hz": float(fs_vital),
-        "range_fft_size": int(range_fft_size),
-        "angle_mode": args.angle_mode,
-        "angle_range_mode": args.angle_range_mode if args.angle_mode in {"beamform", "multi"} else None,
-        "angle_remove_static_mean": bool(args.angle_remove_static_mean) if args.angle_mode in {"beamform", "multi"} else None,
-        "rx_order": subjects[0].get("rx_order", list(range(n_rx))) if subjects else list(range(n_rx)),
-        "rx_spacing_lambda": float(args.rx_spacing_lambda),
         "num_subjects_detected": int(len(subjects)),
         "subjects": subjects,
-        # Backward-compatible top-level fields for existing checks.
-        "selected_range_bin": primary.get("selected_range_bin"),
-        "selected_range_m": primary.get("selected_range_m"),
-        "selected_rx": int(primary.get("selected_rx", -999)) if primary else -999,
-        "rx_mode": primary.get("rx_mode", args.rx_mode),
-        "angle_method": primary.get("angle_method"),
-        "selected_angle_deg": primary.get("selected_angle_deg"),
-        "angle_quality_db": primary.get("angle_quality_db", primary.get("target_quality_db")),
-        "wavelength_m": float(wavelength),
-        "breathing_rate_breaths_per_min": primary.get("breathing_rate_breaths_per_min"),
-        "breathing_quality_db": primary.get("breathing_quality_db"),
-        "heart_rate_beats_per_min": primary.get("heart_rate_beats_per_min"),
-        "heart_quality_db": primary.get("heart_quality_db"),
-        "breathing_band_hz": [float(args.breath_low_hz), float(args.breath_high_hz)],
-        "heart_band_hz": [float(args.heart_low_hz), float(args.heart_high_hz)],
-        "vital_filtering": {
-            "mode": str(getattr(args, "filter_mode", "auto")),
-            "butterworth_order": int(getattr(args, "filter_order", 4)),
-            "note": "auto uses scipy Butterworth zero-phase filtering when scipy is available; otherwise it falls back to FFT masking.",
-        },
-        "validation_mode": {
-            "reference_breath_rates": _parse_reference_list(getattr(args, "reference_breath_rates", None)),
-            "reference_heart_rates": _parse_reference_list(getattr(args, "reference_heart_rates", None)),
-            "note": "Per-subject validation error is stored under each subject when reference values are supplied.",
-        },
-        "vital_frequency_estimation": {
-            "method": "zero_padded_fft_with_quadratic_peak_interpolation" if bool(args.vital_fft_interpolate) else "zero_padded_fft_raw_peak",
-            "heart_peak_method": str(getattr(args, "heart_peak_method", "harmonic_aware")),
-            "heart_harmonic_orders": str(getattr(args, "heart_harmonic_orders", "2,3")),
-            "heart_harmonic_reject_tolerance_bpm": float(getattr(args, "heart_harmonic_reject_tolerance_bpm", 4.0)),
-            "heart_candidate_max_drop_db": float(getattr(args, "heart_candidate_max_drop_db", 10.0)),
-            "zeropad_factor": float(args.vital_fft_zeropad_factor),
-            "minimum_fft_size": int(args.vital_fft_min_size),
-            "true_resolution_per_min": float(60.0 * fs_vital / float(n_frames)),
-            "padded_spacing_per_min": float(60.0 * fs_vital / float(subjects[0].get("breathing_fft_n", max(1, n_frames))) if subjects else float("nan")),
-            "note": "True resolution is limited by capture duration. Zero padding and interpolation improve peak readout, not physical separation of very close rates.",
-        },
-        "target_detection": {
-            "detection_stage": "range_angle_motion_power_with_non_maximum_suppression",
-            "vital_scoring_stage": "post_detection_breathing_and_heart_quality_score_per_subject",
-            "max_subjects": int(args.max_subjects),
-            "target_min_relative_db": float(args.target_min_relative_db),
-            "target_min_quality_db": float(args.target_min_quality_db),
-            "target_min_separation_m": float(args.target_min_separation_m),
-            "target_min_separation_deg": float(args.target_min_separation_deg),
-            "chest_roi_enable": bool(args.chest_roi_enable),
-            "chest_roi_range_m": float(args.chest_roi_range_m),
-            "chest_roi_angle_deg": float(args.chest_roi_angle_deg),
-            "chest_roi_min_relative_db": float(args.chest_roi_min_relative_db),
-            "chest_roi_max_cells": int(args.chest_roi_max_cells),
-            "chest_roi_min_breath_corr": float(args.chest_roi_min_breath_corr),
-        },
-        "rate_trend_estimation": {
-            "window_s": float(getattr(args, "rate_trend_window_s", 30.0)),
-            "step_s": float(getattr(args, "rate_trend_step_s", 2.0)),
-            "note": "Sliding-window trend used for validation plots; final reported rates still come from the full analyzed capture.",
-        },
-        "parser_metadata": metadata,
-        "note": "Engineering/prototype estimate only; not for medical diagnosis.",
+        "dashboard_plot": str(paths["dashboard_plot"]),
     }
-
-    if not args.no_save:
-        with open(str(paths["summary_json"]), "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, default=_json_default)
-        with open(str(paths["summary_txt"]), "w", encoding="utf-8") as f:
-            f.write("ADC-to-vital-signs multi-subject analysis summary\n")
-            f.write("=================================================\n")
-            for k, v in summary.items():
-                if k == "parser_metadata":
-                    f.write("parser_metadata: see JSON summary\n")
-                elif k == "subjects":
-                    f.write("subjects:\n")
-                    for s in subjects:
-                        f.write(
-                            "  subject {idx}: range_bin={rbin}, range_m={rng}, angle_deg={ang}, breath_bpm={bbpm:.2f} raw={braw:.2f}, heart_bpm={hbpm:.2f} raw={hraw:.2f}\n".format(
-                                idx=s.get("subject_index"),
-                                rbin=s.get("selected_range_bin"),
-                                rng=s.get("selected_range_m"),
-                                ang=s.get("selected_angle_deg"),
-                                bbpm=float(s.get("breathing_rate_breaths_per_min", float("nan"))),
-                                braw=float(s.get("breathing_raw_bin_rate_breaths_per_min", float("nan"))),
-                                hbpm=float(s.get("heart_rate_beats_per_min", float("nan"))),
-                                hraw=float(s.get("heart_raw_bin_rate_beats_per_min", float("nan"))),
-                            )
-                        )
-                        if s.get("breathing_true_resolution_per_min") is not None:
-                            f.write("    fft: true_resolution={:.2f}/min, padded_spacing={:.3f}/min, n_fft={}\n".format(
-                                float(s.get("breathing_true_resolution_per_min", float("nan"))),
-                                float(s.get("breathing_padded_spacing_per_min", float("nan"))),
-                                s.get("breathing_fft_n"),
-                            ))
-                        if s.get("roi_enabled"):
-                            f.write("    roi: cells={cells}, range_bins={rbins}, angle={amin}..{amax} deg\n".format(
-                                cells=s.get("roi_cell_count"),
-                                rbins=s.get("roi_range_bins"),
-                                amin=s.get("roi_angle_min_deg"),
-                                amax=s.get("roi_angle_max_deg"),
-                            ))
-                else:
-                    f.write("{}: {}\n".format(k, v))
-        out_paths_by_name["summary_json"] = paths["summary_json"]
-        out_paths_by_name["summary_txt"] = paths["summary_txt"]
-
-    return summary, out_paths_by_name
-
-__all__ = [name for name in globals() if not name.startswith('__')]
+    return summary, {"dashboard_plot": paths["dashboard_plot"]}

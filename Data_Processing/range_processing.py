@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Auto-split from ADC_To_Vital_Signs.py.
-# Keep Python 3.8 compatibility.
-
+"""Range-axis and candidate-bin helpers."""
 from common import *
 from metadata_utils import *
 
@@ -40,26 +38,6 @@ def _derive_range_axis(metadata, n_fft, num_adc_samples):
     freqs = np.arange(n_fft, dtype=np.float64) * fs_hz / float(n_fft)
     ranges = C * freqs / (2.0 * slope_hz_s)
     return ranges, True
-
-def _select_range_bin(range_profile, range_axis, has_metric_axis, min_range_m, max_range_m, min_bin, max_bin):
-    rp = np.asarray(range_profile, dtype=np.float64).copy()
-
-    # Remove DC/very near bins by default.
-    if min_bin is not None and min_bin > 0:
-        rp[: int(min_bin)] = -np.inf
-
-    if max_bin is not None and max_bin < rp.size:
-        rp[int(max_bin) :] = -np.inf
-
-    if has_metric_axis:
-        mask = (range_axis >= min_range_m) & (range_axis <= max_range_m)
-        if np.any(mask):
-            rp[~mask] = -np.inf
-
-    if not np.any(np.isfinite(rp)):
-        raise ValueError("No valid range bins after applying selection limits.")
-
-    return int(np.nanargmax(rp))
 
 def _range_bin_spacing_m(range_axis_pos, has_metric_axis):
     if has_metric_axis and len(range_axis_pos) > 1:
